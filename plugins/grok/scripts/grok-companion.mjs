@@ -69,7 +69,10 @@ const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json"
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
-const MODEL_ALIASES = new Map([["build", "grok-build"], ["fast", "grok-build"]]);
+// Aliases must resolve to ids `grok models` actually lists. An unknown id is a
+// hard error from the CLI, not a fallback to the default, so a stale alias here
+// fails the whole run.
+const MODEL_ALIASES = new Map([["build", "grok-4.5"], ["fast", "grok-4.5"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
 function printUsage() {
@@ -488,7 +491,10 @@ async function executeTaskRun(request) {
     defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
     model: request.model,
     effort: request.effort,
-    sandbox: request.write ? "workspace-write" : "read-only",
+    // Grok's built-in writable profile is `workspace`. `workspace-write` is a
+    // Codex profile name and Grok refuses to start when it is passed, which
+    // takes down every write-capable rescue run.
+    sandbox: request.write ? "workspace" : "read-only",
     onProgress: request.onProgress,
     persistThread: true,
     threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)

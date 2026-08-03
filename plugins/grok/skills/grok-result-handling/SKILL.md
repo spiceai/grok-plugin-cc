@@ -7,6 +7,7 @@ user-invocable: false
 # Grok Result Handling
 
 When the helper returns Grok output:
+- Reproduce it in your reply. The user cannot see Bash or subagent tool results — those are collapsed in the transcript — so a reply that points at the output ("shown above", "see the review above") delivers nothing and wastes the run entirely. Carrying the text into your own message is the only thing that reaches them.
 - Preserve the helper's verdict, summary, findings, and next steps structure.
 - For review output, present findings first and keep them ordered by severity.
 - Use the file paths and line numbers exactly as the helper reports them.

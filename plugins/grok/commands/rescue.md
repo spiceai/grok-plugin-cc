@@ -39,11 +39,12 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-companion.mjs" task-resume-candidate --
 Operating rules:
 
 - The subagent is a thin forwarder only. It should use one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-companion.mjs" task ...` and return that command's stdout as-is.
-- Return the Grok companion stdout verbatim to the user.
+- Reproduce the Grok companion stdout in your reply, exactly as-is.
+- The user does not see the subagent's tool output. Referring to it — "Grok's output is above", "see the result above" — leaves them with nothing, and the work Grok just did is invisible. Copying it into your reply is the only way it reaches them.
 - Do not paraphrase, summarize, rewrite, or add commentary before or after it.
 - Do not ask the subagent to inspect files, monitor progress, poll `/grok:status`, fetch `/grok:result`, call `/grok:cancel`, summarize output, or do follow-up work of its own.
 - Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort.
-- Leave the model unset unless the user explicitly asks for one. If they ask for `build`, map it to `grok-build`.
+- Leave the model unset unless the user explicitly asks for one. If they ask for `build`, map it to `grok-4.5`.
 - Leave `--resume` and `--fresh` in the forwarded request. The subagent handles that routing when it builds the `task` command.
 - If the helper reports that Grok is missing or unauthenticated, stop and tell the user to run `/grok:setup`.
 - If the user did not supply a request, ask what Grok should investigate or fix.

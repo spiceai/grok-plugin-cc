@@ -146,6 +146,132 @@ test("task run returns final message and session id", () => {
   assert.ok(payload.threadId);
 });
 
+/**
+ * Grok only accepts sandbox profiles it actually defines. Passing an unknown
+ * one is not a soft failure — the CLI refuses to start, so a wrong name here
+ * silently takes down every write-capable rescue run while the flag plumbing
+ * still looks correct. `workspace-write` is Codex's name for this and was the
+ * original regression; these profiles are the ones Grok recognises.
+ */
+const GROK_SANDBOX_PROFILES = new Set(["read-only", "workspace", "danger-full-access"]);
+
+function sandboxProfileFrom(binDir) {
+  const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-grok-state.json"), "utf8"));
+  const index = state.lastArgs.indexOf("--sandbox");
+  return index === -1 ? null : state.lastArgs[index + 1];
+}
+
+test("write-capable task requests a sandbox profile grok recognises", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "task-ok");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "task", "--write", "--json", "fix the failing test"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+
+  const profile = sandboxProfileFrom(binDir);
+  assert.ok(
+    GROK_SANDBOX_PROFILES.has(profile),
+    `write-capable task passed --sandbox ${profile}, which grok would reject`
+  );
+  assert.notEqual(profile, "read-only", "a --write task must not run under the read-only profile");
+});
+
+test("read-only task requests the read-only sandbox profile", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "task-ok");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "task", "--json", "inspect the repo"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  assert.equal(sandboxProfileFrom(binDir), "read-only");
+});
+
+function seededTransferPrompt(binDir) {
+  const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-grok-state.json"), "utf8"));
+  const index = state.lastArgs.indexOf("-p");
+  return index === -1 ? "" : state.lastArgs[index + 1];
+}
+
+function writeTranscript(dir, turns) {
+  const transcript = path.join(dir, "session-1.jsonl");
+  fs.writeFileSync(transcript, turns.join("\n"));
+  return transcript;
+}
+
+/**
+ * Only the tail of a transcript is seeded into the transferred session, and real
+ * Claude transcripts reach tens of megabytes — so the reader must not pull the
+ * whole file in to discard nearly all of it. These pin the observable contract:
+ * the newest turns survive, the oldest are dropped, and small transcripts still
+ * transfer whole.
+ */
+test("transfer seeds the tail of a large transcript and drops the head", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-ok");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+
+  const home = makeTempDir("home-");
+  const projectDir = path.join(home, ".claude", "projects", "test-proj");
+  fs.mkdirSync(projectDir, { recursive: true });
+
+  // Comfortably past the 120k-char context budget so truncation must kick in.
+  const turns = [
+    JSON.stringify({ type: "user", message: { role: "user", content: "OLDEST_TURN_MARKER" } })
+  ];
+  for (let i = 0; i < 400; i += 1) {
+    turns.push(
+      JSON.stringify({ type: "assistant", message: { role: "assistant", content: `filler ${i} ${"z".repeat(500)}` } })
+    );
+  }
+  turns.push(JSON.stringify({ type: "user", message: { role: "user", content: "NEWEST_TURN_MARKER" } }));
+  const transcript = writeTranscript(projectDir, turns);
+
+  const result = run("node", [SCRIPT, "transfer", "--source", transcript, "--json"], {
+    cwd,
+    env: { ...env, HOME: home }
+  });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+
+  const prompt = seededTransferPrompt(binDir);
+  assert.ok(prompt.includes("NEWEST_TURN_MARKER"), "most recent turn must be seeded");
+  assert.ok(!prompt.includes("OLDEST_TURN_MARKER"), "oldest turn should have been truncated away");
+  assert.match(prompt, /\(truncated\)/);
+});
+
+test("transfer seeds a small transcript in full", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-ok");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+
+  const home = makeTempDir("home-");
+  const projectDir = path.join(home, ".claude", "projects", "test-proj");
+  fs.mkdirSync(projectDir, { recursive: true });
+  const transcript = writeTranscript(projectDir, [
+    JSON.stringify({ type: "user", message: { role: "user", content: "OLDEST_TURN_MARKER" } }),
+    JSON.stringify({ type: "assistant", message: { role: "assistant", content: "NEWEST_TURN_MARKER" } })
+  ]);
+
+  const result = run("node", [SCRIPT, "transfer", "--source", transcript, "--json"], {
+    cwd,
+    env: { ...env, HOME: home }
+  });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+
+  const prompt = seededTransferPrompt(binDir);
+  assert.ok(prompt.includes("OLDEST_TURN_MARKER"), "short transcript must be seeded whole");
+  assert.ok(prompt.includes("NEWEST_TURN_MARKER"));
+  assert.ok(!prompt.includes("(truncated)"));
+});
+
 test("status and result track finished jobs", () => {
   const binDir = makeTempDir();
   installFakeGrok(binDir, "task-ok");
@@ -259,11 +385,33 @@ test("stop review gate blocks on BLOCK response when enabled", () => {
   assert.match(decision.reason, /BLOCK|debug|issues/i);
 });
 
+/**
+ * `grok models` is the source of truth for model ids, and an unrecognised id is
+ * a hard CLI error rather than a fall back to the default. The alias table is
+ * therefore a compatibility surface with the installed CLI, not a convenience:
+ * `grok-build` was carried over from Codex and failed every aliased run.
+ */
+test("model aliases resolve to a concrete grok model id", async () => {
+  const source = fs.readFileSync(path.join(PLUGIN_ROOT, "scripts", "grok-companion.mjs"), "utf8");
+  const table = /const MODEL_ALIASES = new Map\(\[([\s\S]*?)\]\);/.exec(source);
+  assert.ok(table, "MODEL_ALIASES table not found");
+
+  const targets = [...table[1].matchAll(/\[\s*"[^"]+"\s*,\s*"([^"]+)"\s*\]/g)].map((m) => m[1]);
+  assert.ok(targets.length > 0, "expected at least one alias");
+  for (const target of targets) {
+    assert.match(
+      target,
+      /^grok-\d/,
+      `alias target "${target}" is not a concrete grok model id (check \`grok models\`)`
+    );
+  }
+});
+
 test("buildGrokHeadlessArgs includes resume and disallows writes for read-only", async () => {
   const { buildGrokHeadlessArgs } = await import("../plugins/grok/scripts/lib/grok.mjs");
   const args = buildGrokHeadlessArgs("hello", {
     cwd: "/tmp/project",
-    model: "grok-build",
+    model: "grok-4.5",
     effort: "high",
     resumeSessionId: "abc-123",
     write: false
@@ -274,5 +422,5 @@ test("buildGrokHeadlessArgs includes resume and disallows writes for read-only",
   assert.ok(args.includes("abc-123"));
   assert.ok(args.includes("--disallowed-tools"));
   assert.ok(args.includes("-m"));
-  assert.ok(args.includes("grok-build"));
+  assert.ok(args.includes("grok-4.5"));
 });

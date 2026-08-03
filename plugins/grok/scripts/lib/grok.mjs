@@ -12,6 +12,15 @@ import { readJsonFile } from "./fs.mjs";
 import { binaryAvailable } from "./process.mjs";
 
 const SERVICE_PREFIX = "Grok Companion Task";
+// Reasoning arrives as deltas; accumulate at least this many characters before
+// surfacing a progress line so the log reads as thoughts rather than tokens.
+const THOUGHT_FLUSH_CHARS = 160;
+// How much prior conversation to seed into a transferred Grok session.
+const TRANSFER_CONTEXT_MAX_CHARS = 120_000;
+// First tail window tried when reading a Claude transcript. JSONL carries heavy
+// per-record metadata, so this comfortably covers the text budget above in one
+// read for typical transcripts; buildTransferContext widens it when it does not.
+const TRANSFER_TAIL_INITIAL_BYTES = 1024 * 1024;
 const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current session state. Pick the next highest-value step and follow through until the task is resolved.";
 const DEFAULT_GROK_BIN = "grok";
@@ -379,6 +388,23 @@ export async function runGrokTurn(cwd, options = {}) {
     const events = [];
     let errorMessage = null;
     let settled = false;
+    let pendingThought = "";
+
+    /** Emit whatever reasoning has accumulated as one readable progress line. */
+    const flushThought = () => {
+      const thought = pendingThought.trim();
+      pendingThought = "";
+      if (!thought || reasoningSummary.includes(thought)) {
+        return;
+      }
+      reasoningSummary.push(thought);
+      emitLogEvent(options.onProgress, {
+        message: `Reasoning: ${shorten(thought, 96)}`,
+        phase: "investigating",
+        logTitle: "Reasoning",
+        logBody: thought
+      });
+    };
 
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk) => {
@@ -407,6 +433,13 @@ export async function runGrokTurn(cwd, options = {}) {
       }
       events.push(event);
 
+      // Any other event ends the current run of reasoning deltas, so flush what
+      // has accumulated before reporting it — otherwise a trailing partial
+      // thought is dropped and progress lines arrive out of order.
+      if (event.type !== "thought") {
+        flushThought();
+      }
+
       switch (event.type) {
         case "text": {
           const data = event.data ?? "";
@@ -415,15 +448,13 @@ export async function runGrokTurn(cwd, options = {}) {
           break;
         }
         case "thought": {
-          const thought = String(event.data ?? "").trim();
-          if (thought && !reasoningSummary.includes(thought)) {
-            reasoningSummary.push(thought);
-            emitLogEvent(options.onProgress, {
-              message: `Reasoning: ${shorten(thought, 96)}`,
-              phase: "investigating",
-              logTitle: "Reasoning",
-              logBody: thought
-            });
+          // Grok streams reasoning as deltas, often a single token per event.
+          // Emitting one progress line each would bury the actual output under
+          // hundreds of one-word lines, so deltas are accumulated and flushed
+          // only once they amount to something a human can read.
+          pendingThought += String(event.data ?? "");
+          if (pendingThought.length >= THOUGHT_FLUSH_CHARS) {
+            flushThought();
           }
           break;
         }
@@ -486,6 +517,8 @@ export async function runGrokTurn(cwd, options = {}) {
       }
       settled = true;
       rl.close();
+      // A run can end mid-thought; keep that last fragment rather than losing it.
+      flushThought();
 
       const cleaned = cleanStderr(stderr);
       const status = code === 0 && !errorMessage ? 0 : 1;
@@ -559,6 +592,11 @@ export async function runAppServerReview(cwd, options = {}) {
     model: options.model,
     effort: options.effort,
     write: false,
+    // Match the adversarial-review path, which has always run under the
+    // read-only profile. Grok can still reach a shell here, so this is defence
+    // in depth rather than a hard guarantee — see runGrokTurn's note on
+    // read-only enforcement.
+    sandbox: "read-only",
     onProgress: options.onProgress,
     env: options.env,
     onSpawn: options.onSpawn
@@ -578,18 +616,17 @@ export async function runAppServerReview(cwd, options = {}) {
 }
 
 /**
- * Transfer a Claude session by seeding a new Grok session with transcript context.
- * Grok does not import Claude JSONL natively; we seed context via headless prompt.
+ * Pull the conversational text out of Claude transcript JSONL lines.
+ *
+ * @param {string} text
+ * @returns {string[]}
  */
-export async function importExternalAgentSession(cwd, options = {}) {
-  if (!options.sourcePath) {
-    throw new Error("A Claude session source path is required.");
-  }
-
-  const raw = fs.readFileSync(options.sourcePath, "utf8");
-  const lines = raw.split(/\r?\n/).filter(Boolean);
+function extractTranscriptExcerpts(text) {
   const excerpts = [];
-  for (const line of lines) {
+  for (const line of text.split(/\r?\n/)) {
+    if (!line) {
+      continue;
+    }
     try {
       const entry = JSON.parse(line);
       const role = entry.type === "user" || entry.message?.role === "user" ? "user" : entry.type === "assistant" || entry.message?.role === "assistant" ? "assistant" : null;
@@ -608,12 +645,78 @@ export async function importExternalAgentSession(cwd, options = {}) {
       // skip malformed lines
     }
   }
+  return excerpts;
+}
 
-  const maxChars = 120_000;
-  let body = excerpts.join("\n\n");
-  if (body.length > maxChars) {
-    body = `…(truncated)…\n\n${body.slice(-maxChars)}`;
+/**
+ * Read the last `window` bytes of a file as UTF-8.
+ *
+ * The read always ends at EOF, so only the leading edge can land mid-character —
+ * and the caller discards that partial line anyway.
+ */
+function readTailUtf8(sourcePath, size, window) {
+  const start = Math.max(0, size - window);
+  const length = size - start;
+  if (length === 0) {
+    return "";
   }
+  const buffer = Buffer.alloc(length);
+  const fd = fs.openSync(sourcePath, "r");
+  try {
+    fs.readSync(fd, buffer, 0, length, start);
+  } finally {
+    fs.closeSync(fd);
+  }
+  return buffer.toString("utf8");
+}
+
+/**
+ * Build the transfer prompt's context block from the tail of a Claude transcript.
+ *
+ * Only the last `maxChars` of conversation survive into the prompt, so reading
+ * and parsing the whole file to throw nearly all of it away is wasted work —
+ * real transcripts reach tens of megabytes. Instead this reads a tail window and
+ * widens it only if the window did not yield enough conversation, which keeps
+ * the common case to a single small read while still producing exactly what a
+ * full read would have produced.
+ */
+function buildTransferContext(sourcePath, maxChars) {
+  const { size } = fs.statSync(sourcePath);
+  let window = Math.min(TRANSFER_TAIL_INITIAL_BYTES, size);
+
+  for (;;) {
+    const readWholeFile = window >= size;
+    const text = readTailUtf8(sourcePath, size, window);
+
+    // A tail read almost always starts mid-record; that fragment is not valid
+    // JSON and must not be mistaken for a real turn.
+    let usable = text;
+    if (!readWholeFile) {
+      const firstBreak = text.indexOf("\n");
+      usable = firstBreak === -1 ? "" : text.slice(firstBreak + 1);
+    }
+
+    const body = extractTranscriptExcerpts(usable).join("\n\n");
+    if (body.length > maxChars) {
+      return `…(truncated)…\n\n${body.slice(-maxChars)}`;
+    }
+    if (readWholeFile) {
+      return body;
+    }
+    window = Math.min(window * 4, size);
+  }
+}
+
+/**
+ * Transfer a Claude session by seeding a new Grok session with transcript context.
+ * Grok does not import Claude JSONL natively; we seed context via headless prompt.
+ */
+export async function importExternalAgentSession(cwd, options = {}) {
+  if (!options.sourcePath) {
+    throw new Error("A Claude session source path is required.");
+  }
+
+  const body = buildTransferContext(options.sourcePath, TRANSFER_CONTEXT_MAX_CHARS);
 
   const prompt = [
     "You are continuing work transferred from a Claude Code session.",

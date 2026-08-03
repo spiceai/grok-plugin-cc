@@ -148,3 +148,6 @@ vite.config.ts.timestamp-*
 
 output/
 plugins/grok/.generated/
+
+# Grok plugin eval run artifacts (real Grok runs; not committed)
+evals/runs/

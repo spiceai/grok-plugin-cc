@@ -49,7 +49,8 @@ Foreground flow:
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-companion.mjs" adversarial-review "$ARGUMENTS"
 ```
-- Return the command stdout verbatim, exactly as-is.
+- Reproduce the command stdout in your reply, exactly as-is.
+- The user does not see Bash output. Tool results are collapsed in the transcript, so pointing at it — "the review is above", "output shown above" — leaves them with a blank screen and the review effectively lost. Copying it into your reply is the only way it reaches them.
 - Do not paraphrase, summarize, or add commentary before or after it.
 - Do not fix any issues mentioned in the review output.
 

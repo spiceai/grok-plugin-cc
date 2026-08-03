@@ -144,7 +144,7 @@ Examples:
 /grok:rescue investigate why the tests started failing
 /grok:rescue fix the failing test with the smallest safe patch
 /grok:rescue --resume apply the top fix from the last run
-/grok:rescue --model grok-build --effort medium investigate the flaky integration test
+/grok:rescue --model grok-4.5 --effort medium investigate the flaky integration test
 /grok:rescue --model build fix the issue quickly
 /grok:rescue --background investigate the regression
 ```
@@ -158,7 +158,7 @@ Ask Grok to redesign the database connection to be more resilient.
 **Notes:**
 
 - if you do not pass `--model` or `--effort`, Grok chooses its own defaults.
-- if you say `build` or `fast`, the plugin maps that to `grok-build`
+- if you say `build` or `fast`, the plugin maps that to `grok-4.5`
 - follow-up rescue requests can continue the latest Grok task in the repo
 
 ### `/grok:transfer`
@@ -263,11 +263,11 @@ The plugin wraps the [Grok Build headless CLI](https://x.ai) (`grok -p`). It use
 
 ### Common Configurations
 
-If you want to change the default model that gets used by the plugin, define that in your user-level or project-level config. For example, to prefer `grok-build` for a project, add the following to `~/.grok/config.toml` or project config:
+If you want to change the default model that gets used by the plugin, define that in your user-level or project-level config. For example, to prefer `grok-4.5` for a project, add the following to `~/.grok/config.toml` or project config:
 
 ```toml
 [models]
-default = "grok-build"
+default = "grok-4.5"
 ```
 
 Your configuration will be picked up based on:
