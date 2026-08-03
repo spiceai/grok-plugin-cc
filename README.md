@@ -304,3 +304,11 @@ Yes. If you already use Grok, the plugin picks up the same configuration.
 ### Can I keep using my current API key setup?
 
 Yes. Set `XAI_API_KEY` or use `grok login`. The plugin inherits that auth for headless runs.
+
+## License and attribution
+
+This project is licensed under the [Apache License, Version 2.0](LICENSE).
+
+It is a **derivative work** of OpenAI's [Codex plugin for Claude Code](https://github.com/openai/codex-plugin-cc), which is also licensed under Apache License 2.0. The original copyright notices are retained in [`NOTICE`](NOTICE). This repository's modifications retarget that plugin to the Grok Build CLI; see `NOTICE` for a summary of those changes.
+
+OpenAI, Codex, and related marks are trademarks of their respective owners. This project is not affiliated with or endorsed by OpenAI.

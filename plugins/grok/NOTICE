@@ -1,4 +1,22 @@
-Copyright 2026 xAI
+Grok plugin for Claude Code
+Copyright 2026 Spice AI, Inc. and contributors
+
+This product is a derivative work of the "Codex plugin for Claude Code"
+originally developed by OpenAI and published at:
+
+    https://github.com/openai/codex-plugin-cc
+
+Original copyright notice from that project (retained as required by
+Apache License 2.0, Section 4):
+
+    Copyright 2026 OpenAI
+
+Modifications in this repository include, without limitation: retargeting
+the plugin from the Codex CLI to the Grok Build CLI; renaming the plugin
+surface, package, and marketplace identity; replacing the Codex app-server
+integration with Grok headless mode; and updating documentation, hooks,
+skills, and tests accordingly. Modified files carry those changes relative
+to the original work.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
