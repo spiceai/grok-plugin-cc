@@ -1,0 +1,337 @@
+{
+  "plugin_name": "grok",
+  "notes": "Every eval runs a real `claude -p` session with the plugin loaded, against a throwaway git repo, with a tracing shim in front of the real Grok Build CLI. Assertions grade what Claude did (routing, forwarder discipline, review discipline) and the exact argv the plugin handed to Grok.",
+  "evals": [
+    {
+      "id": "nl-delegate-fix",
+      "name": "Natural-language delegation reaches Grok write-capable",
+      "dimension": "routing",
+      "fixture": "ttl-cache",
+      "prompt": "the ttl test in test/cache.test.mjs is failing and i can't spot why. get grok to fix it",
+      "expected_output": "Claude spawns grok:grok-rescue, which makes exactly one write-capable `task` call and returns Grok's stdout verbatim. Grok fixes the expiresAt bug.",
+      "assertions": [
+        {
+          "id": "routes-to-rescue-subagent",
+          "text": "Spawns the grok:grok-rescue subagent instead of handling it in the main thread",
+          "check": "subagent_spawned",
+          "agentType": "grok:grok-rescue"
+        },
+        {
+          "id": "grok-run-actually-started",
+          "text": "The Grok run starts instead of dying on a CLI/sandbox rejection",
+          "check": "helper_output_not_matches",
+          "pattern": "refusing to start|could not apply the '|sandbox could not be applied|sandbox profile '[^']*' not found"
+        },
+        {
+          "id": "invokes-grok-exactly-once",
+          "text": "Invokes the Grok CLI exactly once",
+          "check": "grok_turns",
+          "equals": 1
+        },
+        {
+          "id": "write-capable-by-default",
+          "text": "Runs Grok write-capable by default (edit tools not blocked) for a fix request",
+          "check": "grok_write_capability",
+          "expect": "write"
+        },
+        {
+          "id": "model-left-unset",
+          "text": "Leaves the model unset when the user did not ask for one",
+          "check": "grok_argv_absent",
+          "tokens": [
+            "-m",
+            "--model"
+          ]
+        },
+        {
+          "id": "effort-left-unset",
+          "text": "Leaves reasoning effort unset when the user did not ask for one",
+          "check": "grok_argv_absent",
+          "tokens": [
+            "--effort"
+          ]
+        },
+        {
+          "id": "forwarder-single-bash-call",
+          "text": "Rescue subagent uses at most one tool call, and only Bash",
+          "check": "subagent_tools",
+          "agentType": "grok:grok-rescue",
+          "allowed": [
+            "Bash"
+          ],
+          "maxCalls": 1
+        },
+        {
+          "id": "forwarder-does-not-inspect-repo",
+          "text": "Rescue subagent never reads, greps, or edits the repository itself",
+          "check": "subagent_tools",
+          "agentType": "grok:grok-rescue",
+          "forbidden": [
+            "Read",
+            "Grep",
+            "Glob",
+            "Edit",
+            "Write",
+            "MultiEdit",
+            "NotebookEdit",
+            "Agent"
+          ]
+        },
+        {
+          "id": "returns-companion-output-verbatim",
+          "text": "Final response carries the companion's Grok output through to the user",
+          "check": "response_matches",
+          "pattern": "\\[grok\\]"
+        },
+        {
+          "id": "bug-actually-fixed",
+          "text": "The failing TTL test passes afterwards",
+          "check": "tests_pass"
+        }
+      ]
+    },
+    {
+      "id": "nl-readonly-diagnose",
+      "name": "Read-only diagnosis request does not get write access",
+      "dimension": "flags",
+      "fixture": "ttl-cache",
+      "prompt": "ask grok to investigate why the ttl test fails and explain the root cause. diagnose only, do not change any code",
+      "expected_output": "Claude routes to grok:grok-rescue, which runs Grok WITHOUT --always-approve. No file on disk changes.",
+      "assertions": [
+        {
+          "id": "routes-to-rescue-subagent",
+          "text": "Spawns the grok:grok-rescue subagent",
+          "check": "subagent_spawned",
+          "agentType": "grok:grok-rescue"
+        },
+        {
+          "id": "grok-run-actually-started",
+          "text": "The Grok run starts instead of dying on a CLI/sandbox rejection",
+          "check": "helper_output_not_matches",
+          "pattern": "refusing to start|could not apply the '|sandbox could not be applied|sandbox profile '[^']*' not found"
+        },
+        {
+          "id": "invokes-grok-exactly-once",
+          "text": "Invokes the Grok CLI exactly once",
+          "check": "grok_turns",
+          "equals": 1
+        },
+        {
+          "id": "read-only-run",
+          "text": "Blocks Grok's edit tools when the user asked for diagnosis only",
+          "check": "grok_write_capability",
+          "expect": "read-only"
+        },
+        {
+          "id": "no-files-modified",
+          "text": "Leaves every file in the repository untouched",
+          "check": "files_unchanged"
+        },
+        {
+          "id": "forwarder-does-not-inspect-repo",
+          "text": "Rescue subagent never reads, greps, or edits the repository itself",
+          "check": "subagent_tools",
+          "agentType": "grok:grok-rescue",
+          "forbidden": [
+            "Read",
+            "Grep",
+            "Glob",
+            "Edit",
+            "Write",
+            "MultiEdit",
+            "NotebookEdit",
+            "Agent"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "slash-rescue-flag-mapping",
+      "name": "Rescue flags map onto the right Grok CLI arguments",
+      "dimension": "flags",
+      "fixture": "ttl-cache",
+      "prompt": "/grok:rescue --model build --effort medium --fresh fix the ttl expiry bug in src/cache.js",
+      "expected_output": "Grok is invoked with `-m grok-4.5 --effort medium --sandbox workspace`, no --resume, and the routing flags are stripped from the natural-language task text.",
+      "assertions": [
+        {
+          "id": "maps-build-alias-to-a-real-model",
+          "text": "Maps the `build` alias onto the concrete grok-4.5 model id",
+          "check": "grok_argv_sequence",
+          "tokens": [
+            "-m",
+            "grok-4.5"
+          ]
+        },
+        {
+          "id": "grok-run-actually-started",
+          "text": "The Grok run starts instead of dying on a CLI/sandbox rejection",
+          "check": "helper_output_not_matches",
+          "pattern": "refusing to start|could not apply the '|sandbox could not be applied|sandbox profile '[^']*' not found"
+        },
+        {
+          "id": "passes-effort-through",
+          "text": "Passes `--effort medium` through to the Grok CLI",
+          "check": "grok_argv_sequence",
+          "tokens": [
+            "--effort",
+            "medium"
+          ]
+        },
+        {
+          "id": "fresh-suppresses-resume",
+          "text": "Honours --fresh by not resuming a prior session",
+          "check": "grok_argv_absent",
+          "tokens": [
+            "--resume",
+            "-r"
+          ]
+        },
+        {
+          "id": "write-capable-for-fix",
+          "text": "Runs Grok write-capable for an explicit fix request",
+          "check": "grok_write_capability",
+          "expect": "write"
+        },
+        {
+          "id": "routing-flags-stripped-from-prompt",
+          "text": "Routing flags do not leak into the natural-language prompt sent to Grok",
+          "check": "grok_prompt_not_matches",
+          "pattern": "--model|--effort|--fresh|--background|--wait"
+        },
+        {
+          "id": "invokes-grok-exactly-once",
+          "text": "Invokes the Grok CLI exactly once",
+          "check": "grok_turns",
+          "equals": 1
+        }
+      ]
+    },
+    {
+      "id": "slash-review-no-autofix",
+      "name": "Review presents findings and stops without fixing",
+      "dimension": "review-discipline",
+      "fixture": "ttl-cache",
+      "prompt": "/grok:review --wait",
+      "expected_output": "Grok reviews the uncommitted change, Claude relays the findings, and no file is touched. The expiresAt bug should appear in the findings.",
+      "assertions": [
+        {
+          "id": "invokes-grok-exactly-once",
+          "text": "Invokes the Grok CLI exactly once",
+          "check": "grok_turns",
+          "equals": 1
+        },
+        {
+          "id": "grok-run-actually-started",
+          "text": "The Grok run starts instead of dying on a CLI/sandbox rejection",
+          "check": "helper_output_not_matches",
+          "pattern": "refusing to start|could not apply the '|sandbox could not be applied|sandbox profile '[^']*' not found"
+        },
+        {
+          "id": "review-runs-read-only",
+          "text": "Blocks Grok's edit tools for a review",
+          "check": "grok_write_capability",
+          "expect": "read-only"
+        },
+        {
+          "id": "no-edit-tools-used",
+          "text": "Claude never invokes a file-editing tool during or after the review",
+          "check": "main_tools_absent",
+          "tools": [
+            "Edit",
+            "Write",
+            "MultiEdit",
+            "NotebookEdit"
+          ]
+        },
+        {
+          "id": "no-files-modified",
+          "text": "Leaves every file in the repository untouched",
+          "check": "files_unchanged"
+        },
+        {
+          "id": "grok-finds-the-real-defect",
+          "text": "Grok's review identifies the TTL/expiresAt defect",
+          "check": "helper_output_matches",
+          "pattern": "expiresAt|ttlMs|TTL"
+        },
+        {
+          "id": "findings-reach-the-user",
+          "text": "Those findings actually appear in the user-visible response, not just in the tool result",
+          "check": "response_matches",
+          "pattern": "expiresAt|ttlMs|TTL"
+        }
+      ]
+    },
+    {
+      "id": "no-hijack-trivial-task",
+      "name": "Trivial local edits are not handed off to Grok",
+      "dimension": "routing",
+      "fixture": "ttl-cache",
+      "prompt": "add a short JSDoc comment above the get() method in src/cache.js explaining what it returns",
+      "expected_output": "Claude does this itself. Grok is never invoked and the rescue subagent is never spawned.",
+      "assertions": [
+        {
+          "id": "grok-not-invoked",
+          "text": "Never invokes the Grok CLI for a task the main thread can finish",
+          "check": "grok_turns",
+          "equals": 0
+        },
+        {
+          "id": "rescue-subagent-not-spawned",
+          "text": "Never spawns the grok:grok-rescue subagent",
+          "check": "subagent_absent",
+          "agentType": "grok:grok-rescue"
+        },
+        {
+          "id": "claude-did-the-work",
+          "text": "Claude edits src/cache.js itself",
+          "check": "files_changed",
+          "paths": [
+            "src/cache.js"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "nl-review-routing",
+      "name": "Natural-language review request reaches Grok or points at the command",
+      "dimension": "routing",
+      "fixture": "ttl-cache",
+      "prompt": "can grok look over my uncommitted changes and tell me if anything looks wrong?",
+      "expected_output": "Because /grok:review sets disable-model-invocation, Claude cannot call it directly. Either it routes the review through the rescue subagent, or it tells the user to run /grok:review. What it must not do is silently review the code itself.",
+      "assertions": [
+        {
+          "id": "grok-involved-or-command-surfaced",
+          "text": "Either Grok actually runs, or the user is pointed at /grok:review",
+          "check": "any_of",
+          "checks": [
+            {
+              "check": "grok_turns",
+              "min": 1
+            },
+            {
+              "check": "response_matches",
+              "pattern": "/grok:review"
+            }
+          ]
+        },
+        {
+          "id": "no-files-modified",
+          "text": "Leaves every file in the repository untouched",
+          "check": "files_unchanged"
+        },
+        {
+          "id": "no-edit-tools-used",
+          "text": "Claude never invokes a file-editing tool for a review request",
+          "check": "main_tools_absent",
+          "tools": [
+            "Edit",
+            "Write",
+            "MultiEdit",
+            "NotebookEdit"
+          ]
+        }
+      ]
+    }
+  ]
+}

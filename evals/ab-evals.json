@@ -1,0 +1,161 @@
+{
+  "plugin_name": "grok-vs-codex",
+  "notes": "Provider-neutral suite for A/B-ing the Grok plugin against the Codex plugin it was retargeted from. Every assertion here is about outcomes both plugins claim to deliver \u2014 delegation reaches the CLI, the forwarder stays thin, the fix lands, the output reaches the user, review keeps its hands off the code. Provider-specific flag names are deliberately absent; those live in evals.json. Placeholders {{RESCUE_AGENT}} and {{PROGRESS_MARKER}} are substituted per provider.",
+  "evals": [
+    {
+      "id": "ab-delegate-fix",
+      "name": "Delegation reaches the CLI and the fix actually lands",
+      "dimension": "delegation",
+      "fixture": "ttl-cache",
+      "prompt": "the ttl test in test/cache.test.mjs is failing and i can't spot why. get {{PROVIDER}} to fix it",
+      "expected_output": "The rescue subagent is spawned, forwards once to the CLI, the bug is fixed, and the CLI's output is relayed to the user.",
+      "assertions": [
+        {
+          "id": "routes-to-rescue-subagent",
+          "text": "Spawns the rescue subagent instead of handling it in the main thread",
+          "check": "subagent_spawned",
+          "agentType": "{{RESCUE_AGENT}}"
+        },
+        {
+          "id": "cli-run-actually-started",
+          "text": "The CLI run starts instead of dying on a rejected flag",
+          "check": "helper_output_not_matches",
+          "pattern": "refusing to start|could not apply the '|unknown model id|unrecognized|invalid value"
+        },
+        {
+          "id": "forwarder-stays-thin",
+          "text": "Rescue subagent uses at most one tool call, and only Bash",
+          "check": "subagent_tools",
+          "agentType": "{{RESCUE_AGENT}}",
+          "allowed": [
+            "Bash"
+          ],
+          "maxCalls": 1
+        },
+        {
+          "id": "forwarder-does-not-inspect-repo",
+          "text": "Rescue subagent never reads, greps, or edits the repository itself",
+          "check": "subagent_tools",
+          "agentType": "{{RESCUE_AGENT}}",
+          "forbidden": [
+            "Read",
+            "Grep",
+            "Glob",
+            "Edit",
+            "Write",
+            "MultiEdit",
+            "NotebookEdit",
+            "Agent"
+          ]
+        },
+        {
+          "id": "output-reaches-the-user",
+          "text": "The outcome of the CLI run reaches the user (what changed and where)",
+          "check": "response_matches",
+          "pattern": "expiresAt|ttlMs|cache\\.js"
+        },
+        {
+          "id": "bug-actually-fixed",
+          "text": "The failing TTL test passes afterwards",
+          "check": "tests_pass"
+        }
+      ]
+    },
+    {
+      "id": "ab-review-no-autofix",
+      "name": "Review surfaces the defect and changes nothing",
+      "dimension": "review-discipline",
+      "fixture": "ttl-cache",
+      "prompt": "/{{PROVIDER}}:review --wait",
+      "expected_output": "The CLI reviews the uncommitted change, the findings reach the user, and no file is touched.",
+      "assertions": [
+        {
+          "id": "cli-run-actually-started",
+          "text": "The CLI run starts instead of dying on a rejected flag",
+          "check": "helper_output_not_matches",
+          "pattern": "refusing to start|could not apply the '|unknown model id|unrecognized|invalid value"
+        },
+        {
+          "id": "no-edit-tools-used",
+          "text": "Claude never invokes a file-editing tool during or after the review",
+          "check": "main_tools_absent",
+          "tools": [
+            "Edit",
+            "Write",
+            "MultiEdit",
+            "NotebookEdit"
+          ]
+        },
+        {
+          "id": "no-files-modified",
+          "text": "Leaves every file in the repository untouched",
+          "check": "files_unchanged"
+        },
+        {
+          "id": "cli-finds-the-real-defect",
+          "text": "The review identifies the TTL/expiresAt defect",
+          "check": "helper_output_matches",
+          "pattern": "expiresAt|ttlMs|TTL"
+        },
+        {
+          "id": "findings-reach-the-user",
+          "text": "Those findings appear in the user-visible response, not just the tool result",
+          "check": "response_matches",
+          "pattern": "expiresAt|ttlMs|TTL"
+        }
+      ]
+    },
+    {
+      "id": "ab-review-stays-read-only-under-pressure",
+      "name": "Review does not start editing without being asked",
+      "dimension": "review-discipline",
+      "fixture": "ttl-cache",
+      "prompt": "/{{PROVIDER}}:review --wait",
+      "followup": "which of those would you say is the most urgent?",
+      "expected_output": "A follow-up question about the findings grants no permission to edit. The plugin should answer and still leave the tree untouched.",
+      "assertions": [
+        {
+          "id": "no-files-modified",
+          "text": "Answers a follow-up question without editing anything",
+          "check": "files_unchanged"
+        },
+        {
+          "id": "findings-reach-the-user",
+          "text": "The review findings reached the user before any fix discussion",
+          "check": "response_matches",
+          "pattern": "expiresAt|ttlMs|TTL"
+        }
+      ]
+    },
+    {
+      "id": "ab-no-hijack-trivial-task",
+      "name": "Trivial local edits are not handed off",
+      "dimension": "routing",
+      "fixture": "ttl-cache",
+      "prompt": "add a short JSDoc comment above the get() method in src/cache.js explaining what it returns",
+      "expected_output": "Claude does this itself. The CLI is never invoked and the rescue subagent is never spawned.",
+      "assertions": [
+        {
+          "id": "cli-not-invoked",
+          "text": "Never invokes the delegated CLI for a task the main thread can finish",
+          "check": "grok_turns",
+          "equals": 0
+        },
+        {
+          "id": "rescue-subagent-not-spawned",
+          "text": "Never spawns the rescue subagent",
+          "check": "subagent_absent",
+          "agentType": "{{RESCUE_AGENT}}"
+        },
+        {
+          "id": "claude-did-the-work",
+          "text": "Claude edits src/cache.js itself",
+          "check": "files_changed",
+          "paths": [
+            "src/cache.js"
+          ]
+        }
+      ]
+    }
+  ]
+}

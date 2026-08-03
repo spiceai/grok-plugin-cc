@@ -1,0 +1,7 @@
+#!/usr/bin/env node
+import os from "node:os";
+import path from "node:path";
+
+import { runTraceShim } from "../lib/shim.mjs";
+
+runTraceShim("GROK_REAL_BIN", path.join(os.homedir(), ".grok", "bin", "grok"));
