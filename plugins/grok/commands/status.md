@@ -1,7 +1,6 @@
 ---
-description: Show active and recent Grok jobs for this repository, including review-gate status
+description: Show active and recent Grok jobs for this repository, including review-gate status. Use whenever the user asks how a Grok run is going, whether Grok finished, what Grok is doing, or to check on a background Grok review or rescue job.
 argument-hint: '[job-id] [--wait] [--timeout-ms <ms>] [--all]'
-disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---
 

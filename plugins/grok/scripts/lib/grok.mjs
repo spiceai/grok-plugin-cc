@@ -380,15 +380,33 @@ export async function runGrokTurn(cwd, options = {}) {
 
     let stderr = "";
     let sessionId = options.resumeSessionId ?? options.resumeThreadId ?? null;
-    let finalMessage = "";
-    let textChunks = [];
+    // A single agent turn emits many assistant messages: narration before a tool
+    // call, then the real answer after it. Each message is one segment; `text`
+    // deltas append to the open segment and a tool call closes it. Gluing them
+    // all into one string is what produced runs of back-to-back JSON objects
+    // that no parser could accept.
+    /** @type {string[]} */
+    const messageSegments = [];
+    let openSegment = "";
     /** @type {string[]} */
     let reasoningSummary = [];
     /** @type {object[]} */
     const events = [];
+    let structuredOutput = null;
+    let stopReason = null;
     let errorMessage = null;
     let settled = false;
+    let streamEnded = false;
+    let exitCode = null;
     let pendingThought = "";
+
+    const closeSegment = () => {
+      const segment = openSegment.trim();
+      openSegment = "";
+      if (segment) {
+        messageSegments.push(segment);
+      }
+    };
 
     /** Emit whatever reasoning has accumulated as one readable progress line. */
     const flushThought = () => {
@@ -442,9 +460,7 @@ export async function runGrokTurn(cwd, options = {}) {
 
       switch (event.type) {
         case "text": {
-          const data = event.data ?? "";
-          textChunks.push(data);
-          finalMessage = textChunks.join("");
+          openSegment += String(event.data ?? "");
           break;
         }
         case "thought": {
@@ -459,11 +475,14 @@ export async function runGrokTurn(cwd, options = {}) {
           break;
         }
         case "tool_call": {
+          // A tool call ends the assistant message that preceded it.
+          closeSegment();
           const phase = toolCallPhase(event);
           emitProgress(options.onProgress, describeToolCall(event), phase);
           break;
         }
         case "tool_call_update": {
+          closeSegment();
           if (event.status === "completed" || event.status === "failed") {
             const title = event.title || event.toolName || event.toolCallId || "tool";
             emitProgress(
@@ -475,18 +494,26 @@ export async function runGrokTurn(cwd, options = {}) {
           break;
         }
         case "plan": {
+          closeSegment();
           emitProgress(options.onProgress, "Plan updated.", "investigating");
           break;
         }
         case "end": {
+          closeSegment();
           if (event.sessionId) {
             sessionId = event.sessionId;
           }
-          if (event.result && typeof event.result === "string" && !finalMessage) {
-            finalMessage = event.result;
+          if (event.stopReason) {
+            stopReason = String(event.stopReason);
           }
-          if (event.stopReason && event.stopReason !== "end_turn" && event.stopReason !== "stop") {
-            // keep message; status decided by exit code
+          // Grok parses and schema-validates the structured answer itself when
+          // `--json-schema` is set. That object is authoritative — re-deriving it
+          // from the text stream is what made well-formed runs look malformed.
+          if (event.structuredOutput && typeof event.structuredOutput === "object") {
+            structuredOutput = event.structuredOutput;
+          }
+          if (typeof event.result === "string" && event.result.trim() && messageSegments.length === 0) {
+            messageSegments.push(event.result.trim());
           }
           emitProgress(options.onProgress, "Grok turn completed.", "finalizing", {
             threadId: sessionId
@@ -494,6 +521,7 @@ export async function runGrokTurn(cwd, options = {}) {
           break;
         }
         case "error": {
+          closeSegment();
           errorMessage = event.message ?? "Grok reported an error.";
           emitProgress(options.onProgress, `Grok error: ${errorMessage}`, "failed");
           break;
@@ -511,37 +539,43 @@ export async function runGrokTurn(cwd, options = {}) {
       reject(error);
     });
 
-    child.on("close", (code) => {
-      if (settled) {
+    // The last stdout line carries the session id and the structured answer, so
+    // resolving the moment the process exits can drop the very thing the caller
+    // came for. Settle only once the process has exited *and* readline has
+    // drained every buffered line.
+    const settle = () => {
+      if (settled || !streamEnded || exitCode === null) {
         return;
       }
       settled = true;
-      rl.close();
-      // A run can end mid-thought; keep that last fragment rather than losing it.
+      // A run can end mid-thought or mid-message; keep those fragments.
       flushThought();
+      closeSegment();
 
       const cleaned = cleanStderr(stderr);
-      const status = code === 0 && !errorMessage ? 0 : 1;
-      if (!finalMessage && errorMessage) {
-        finalMessage = errorMessage;
-      }
-
-      // Prefer last complete text if streaming left fragments.
-      if (!finalMessage) {
-        const endEvent = [...events].reverse().find((e) => e.type === "end");
-        if (endEvent?.result) {
-          finalMessage = String(endEvent.result);
-        }
-      }
+      const status = exitCode === 0 && !errorMessage ? 0 : 1;
+      const finalSegment = messageSegments.length > 0 ? messageSegments[messageSegments.length - 1] : "";
+      // Segments are separate assistant messages. Joining them bare ran the last
+      // word of one into the first word of the next; a blank line keeps the
+      // transcript readable and keeps adjacent JSON objects distinguishable.
+      const finalMessage = messageSegments.join("\n\n") || (errorMessage ?? "");
 
       resolve({
         status,
         threadId: sessionId,
         turnId: null,
         finalMessage,
+        finalSegment,
+        messageSegments,
+        structuredOutput,
+        stopReason,
         reviewText: finalMessage,
         reasoningSummary,
-        error: errorMessage ? { message: errorMessage } : code && code !== 0 ? { message: cleaned || `grok exited with code ${code}` } : null,
+        error: errorMessage
+          ? { message: errorMessage }
+          : exitCode && exitCode !== 0
+            ? { message: cleaned || `grok exited with code ${exitCode}` }
+            : null,
         stderr: cleaned,
         fileChanges: [],
         touchedFiles: collectTouchedFilesFromEvents(events),
@@ -549,6 +583,16 @@ export async function runGrokTurn(cwd, options = {}) {
         events,
         pid: child.pid ?? null
       });
+    };
+
+    rl.on("close", () => {
+      streamEnded = true;
+      settle();
+    });
+
+    child.on("close", (code) => {
+      exitCode = code ?? 0;
+      settle();
     });
   });
 }
@@ -767,49 +811,233 @@ export function buildPersistentTaskThreadName(prompt) {
   return buildTaskThreadName(prompt);
 }
 
+/**
+ * Walk `text` as JSON, tracking string state so braces inside string literals
+ * are not mistaken for structure.
+ *
+ * @returns {{ objects: string[], openStack: string[], openStart: number, inString: boolean }}
+ */
+function scanJsonStructure(text) {
+  /** @type {string[]} */
+  const objects = [];
+  /** @type {string[]} */
+  const stack = [];
+  let openStart = -1;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+    } else if (char === "{" || char === "[") {
+      if (stack.length === 0) {
+        openStart = index;
+      }
+      stack.push(char);
+    } else if (char === "}" || char === "]") {
+      if (stack.length > 0) {
+        stack.pop();
+        if (stack.length === 0 && openStart !== -1) {
+          objects.push(text.slice(openStart, index + 1));
+          openStart = -1;
+        }
+      }
+    }
+  }
+
+  return { objects, openStack: stack, openStart, inString };
+}
+
+/**
+ * Close the containers a truncated JSON fragment left open.
+ *
+ * A fragment can end anywhere — mid-string, after a dangling comma, or on a key
+ * with no value yet — so the caller retries this over shrinking prefixes rather
+ * than trusting any single close to parse.
+ */
+function closeOpenStructures(fragment) {
+  const { openStack, inString } = scanJsonStructure(fragment);
+  if (openStack.length === 0) {
+    return fragment;
+  }
+
+  let text = inString ? `${fragment}"` : fragment;
+  text = text.replace(/[,\s]+$/, "");
+  // Drop a key whose value never arrived, then any comma it left behind.
+  text = text.replace(/,?\s*"(?:[^"\\]|\\.)*"\s*:\s*$/, "").replace(/[,\s]+$/, "");
+  for (let index = openStack.length - 1; index >= 0; index -= 1) {
+    text += openStack[index] === "{" ? "}" : "]";
+  }
+  return text;
+}
+
+// Bound the salvage search so a large malformed blob cannot spin for long.
+const MAX_REPAIR_ATTEMPTS = 400;
+
+/**
+ * Recover the largest parseable prefix of a truncated JSON fragment.
+ *
+ * A review cut off by the output-token budget still contains every finding that
+ * was emitted before the cut; discarding all of them because the last one is
+ * half-written throws away the entire run.
+ */
+function repairTruncatedJson(fragment) {
+  const boundaries = [fragment.length];
+  for (let index = fragment.length - 1; index >= 0 && boundaries.length <= MAX_REPAIR_ATTEMPTS; index -= 1) {
+    const char = fragment[index];
+    if (char === "}" || char === "]") {
+      boundaries.push(index + 1);
+    }
+  }
+
+  for (const end of boundaries) {
+    const candidate = closeOpenStructures(fragment.slice(0, end));
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === "object") {
+        return parsed;
+      }
+    } catch {
+      // Shrink further and retry.
+    }
+  }
+  return null;
+}
+
+function stripCodeFences(text) {
+  const blocks = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)].map((match) => match[1].trim()).filter(Boolean);
+  return blocks;
+}
+
+/**
+ * Collect every plausible JSON payload in one assistant message, newest first.
+ *
+ * Grok narrates between tool calls, and under a JSON schema that narration is
+ * itself JSON — so a message can hold several complete objects. The last one is
+ * the answer; earlier ones are drafts.
+ */
+function collectJsonCandidates(text) {
+  const candidates = [];
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return candidates;
+  }
+
+  const fenced = stripCodeFences(trimmed);
+  for (const block of [...fenced].reverse()) {
+    candidates.push(...scanJsonStructure(block).objects.reverse(), block);
+  }
+
+  candidates.push(...scanJsonStructure(trimmed).objects.reverse());
+  candidates.push(trimmed);
+  return candidates;
+}
+
+function describeTruncation(stopReason) {
+  if (!stopReason || stopReason === "end_turn" || stopReason === "stop") {
+    return null;
+  }
+  if (/max.?tokens|length|truncat/i.test(stopReason)) {
+    return `Grok stopped early (stopReason: ${stopReason}), so its JSON was cut off mid-object.`;
+  }
+  return `Grok stopped with stopReason: ${stopReason}.`;
+}
+
+/**
+ * Turn a Grok run's output into the structured object a review expects.
+ *
+ * @param {string} rawOutput full assistant text, used for display and as a last resort
+ * @param {{ structuredOutput?: object|null, segments?: string[], stopReason?: string|null, failureMessage?: string|null }} [fallback]
+ */
 export function parseStructuredOutput(rawOutput, fallback = {}) {
-  if (!rawOutput) {
+  const stopReason = fallback.stopReason ?? null;
+  const truncationNote = describeTruncation(stopReason);
+
+  // Grok already parsed and schema-validated this when `--json-schema` was set.
+  if (fallback.structuredOutput && typeof fallback.structuredOutput === "object" && !Array.isArray(fallback.structuredOutput)) {
     return {
-      parsed: null,
-      parseError: fallback.failureMessage ?? "Grok did not return a final structured message.",
+      parsed: fallback.structuredOutput,
+      parseError: null,
       rawOutput: rawOutput ?? "",
       ...fallback
     };
   }
 
-  const text = String(rawOutput).trim();
+  const segments = Array.isArray(fallback.segments) ? fallback.segments.filter((segment) => String(segment ?? "").trim()) : [];
+  const text = String(rawOutput ?? "").trim();
 
-  // Prefer fenced JSON or a whole-string JSON object.
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const candidates = [];
-  if (fenced?.[1]) {
-    candidates.push(fenced[1].trim());
-  }
-  candidates.push(text);
-
-  // Also try first { ... } block.
-  const braceStart = text.indexOf("{");
-  const braceEnd = text.lastIndexOf("}");
-  if (braceStart !== -1 && braceEnd > braceStart) {
-    candidates.push(text.slice(braceStart, braceEnd + 1));
+  if (!text && segments.length === 0) {
+    return {
+      parsed: null,
+      parseError: fallback.failureMessage || truncationNote || "Grok did not return a final structured message.",
+      rawOutput: rawOutput ?? "",
+      ...fallback
+    };
   }
 
-  for (const candidate of candidates) {
-    try {
+  // The final assistant message first, then earlier ones, then the whole blob.
+  const sources = [...[...segments].reverse(), text].filter(Boolean);
+  const matchesShape = typeof fallback.shapeCheck === "function" ? fallback.shapeCheck : null;
+  let looseMatch = null;
+
+  for (const source of sources) {
+    for (const candidate of collectJsonCandidates(source)) {
+      let parsed;
+      try {
+        parsed = JSON.parse(candidate);
+      } catch {
+        continue;
+      }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        continue;
+      }
+      if (!matchesShape || matchesShape(parsed)) {
+        return { parsed, parseError: null, rawOutput, ...fallback };
+      }
+      // Keep the newest object that at least parsed, in case nothing matches the
+      // expected shape — a wrong-shaped answer still beats no answer at all.
+      looseMatch ??= parsed;
+    }
+  }
+
+  if (looseMatch) {
+    return { parsed: looseMatch, parseError: null, rawOutput, ...fallback };
+  }
+
+  // Nothing parsed cleanly — the output is most likely cut off. Salvage it.
+  for (const source of sources) {
+    const { openStack, openStart } = scanJsonStructure(source);
+    if (openStack.length === 0 || openStart === -1) {
+      continue;
+    }
+    const repaired = repairTruncatedJson(source.slice(openStart));
+    if (repaired) {
       return {
-        parsed: JSON.parse(candidate),
+        parsed: repaired,
         parseError: null,
+        recovered: "truncated-json",
         rawOutput,
         ...fallback
       };
-    } catch {
-      // try next
     }
   }
 
   return {
     parsed: null,
-    parseError: "Could not parse structured JSON from Grok output.",
+    parseError: truncationNote
+      ? `${truncationNote} Could not recover a usable object from it.`
+      : "Could not parse structured JSON from Grok output.",
     rawOutput,
     ...fallback
   };

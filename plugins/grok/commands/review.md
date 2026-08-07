@@ -1,7 +1,6 @@
 ---
-description: Run a Grok code review against local git state
+description: Run a Grok code review of the local git changes (working tree or branch diff). Use whenever the user asks for a Grok review, a second opinion from Grok, or wants Grok to look over the current changes, this branch, or a diff — including phrasings like "have grok review this", "get grok to check my changes", or "run a grok review".
 argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch]'
-disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
 

@@ -1,7 +1,6 @@
 ---
-description: Show the stored final output for a finished Grok job in this repository
+description: Show the stored final output for a finished Grok job in this repository. Use when the user asks what Grok found, wants the results of a finished Grok review or rescue run, or asks to see the output of a background Grok job.
 argument-hint: '[job-id]'
-disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---
 

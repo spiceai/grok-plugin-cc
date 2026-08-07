@@ -1,7 +1,6 @@
 ---
-description: Run a Grok review that challenges the implementation approach and design choices
+description: Run a Grok review that challenges the implementation approach and design choices, returning structured findings by severity. Use when the user wants a harsher, adversarial, or skeptical Grok review, wants the design or approach challenged rather than just the code checked, or wants a Grok review focused on a specific concern such as auth, races, or data loss.
 argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [focus ...]'
-disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
 

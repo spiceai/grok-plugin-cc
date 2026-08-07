@@ -140,15 +140,45 @@ test("transfer, result, and cancel commands are exposed as deterministic runtime
   const cancel = read("commands/cancel.md");
   const resultHandling = read("skills/grok-result-handling/SKILL.md");
 
-  assert.match(transfer, /disable-model-invocation:\s*true/);
   assert.match(transfer, /grok-companion\.mjs" transfer "\$ARGUMENTS"/);
   assert.match(transfer, /grok --resume <session-id>/);
-  assert.match(result, /disable-model-invocation:\s*true/);
   assert.match(result, /grok-companion\.mjs" result "\$ARGUMENTS"/);
-  assert.match(cancel, /disable-model-invocation:\s*true/);
   assert.match(cancel, /grok-companion\.mjs" cancel "\$ARGUMENTS"/);
   assert.match(resultHandling, /do not turn a failed or incomplete Grok run into a Claude-side implementation attempt/i);
   assert.match(resultHandling, /if Grok was never successfully invoked, do not generate a substitute answer at all/i);
+});
+
+/**
+ * `disable-model-invocation: true` makes a command user-typed-only. Every
+ * command carrying it left Claude unable to act on "have Grok review this" —
+ * the model could only tell the user to type the slash command themselves,
+ * which is the opposite of a plugin that hands work to Grok.
+ */
+test("every command stays invocable by Claude, not only by the user", () => {
+  const commandsDir = path.join(PLUGIN_ROOT, "commands");
+  for (const file of fs.readdirSync(commandsDir).sort()) {
+    const source = fs.readFileSync(path.join(commandsDir, file), "utf8");
+    assert.doesNotMatch(
+      source,
+      /disable-model-invocation:\s*true/,
+      `commands/${file} blocks model invocation, so Claude can only ask the user to run it`
+    );
+  }
+});
+
+/**
+ * A command is routed to by its description alone. A bare label like "Run a
+ * Grok code review" gives the model nothing to match "have grok look at this"
+ * against, so the description has to carry the trigger phrasings.
+ */
+test("command descriptions carry the phrasings Claude routes on", () => {
+  assert.match(read("commands/review.md"), /description:.*\buse\b.*(review|second opinion)/i);
+  assert.match(read("commands/adversarial-review.md"), /description:.*\buse when\b/i);
+  assert.match(read("commands/rescue.md"), /description:.*(ask grok|have grok)/i);
+  assert.match(read("commands/status.md"), /description:.*\buse\b/i);
+  assert.match(read("commands/result.md"), /description:.*\buse when\b/i);
+  assert.match(read("commands/cancel.md"), /description:.*\buse when\b/i);
+  assert.match(read("commands/transfer.md"), /description:.*\buse when\b/i);
 });
 
 test("internal docs use task terminology for rescue runs", () => {

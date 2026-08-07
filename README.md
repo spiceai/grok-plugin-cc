@@ -79,6 +79,10 @@ One simple first run is:
 
 ## Usage
 
+Every command below can be typed as a slash command, and Claude can also reach for
+it on its own. Asking "have Grok review this" or "get Grok to fix the failing test"
+routes to the right command without you naming it.
+
 ### `/grok:review`
 
 Runs a normal Grok review on your current work.

@@ -58,6 +58,20 @@ Every finding must include:
 Write the summary like a terse ship/no-ship assessment, not a neutral recap.
 </structured_output_contract>
 
+<single_emission_rule>
+Emit the JSON object exactly once, as the very last thing you say.
+Do not emit a draft, a partial object, a status object, or a "review in progress" object while you are still investigating. Everything you emit is captured, so an early draft is concatenated with the final answer and the combined text is not valid JSON.
+While working, either stay silent or write plain prose that is obviously not JSON. Never open a `{` until you are ready to emit the final answer.
+Do not repeat the object, wrap it in code fences, or add prose before or after it.
+</single_emission_rule>
+
+<budget>
+At most 10 findings, ordered most severe first. If you have more, keep only the strongest.
+Keep each `body` under roughly 900 characters and each `recommendation` under roughly 400.
+At most 6 `next_steps`, one line each.
+Running past the output budget truncates the JSON mid-object and loses the whole review, so trim the weakest findings rather than risk the cut.
+</budget>
+
 <grounding_rules>
 Be aggressive, but stay grounded.
 Every finding must be defensible from the provided repository context or tool outputs.

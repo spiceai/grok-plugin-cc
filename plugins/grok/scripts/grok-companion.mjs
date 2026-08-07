@@ -259,6 +259,35 @@ function ensureGrokAvailable(cwd) {
   }
 }
 
+const REVIEW_REEMIT_PROMPT = [
+  "Your previous answer could not be read as a single JSON object.",
+  "Re-emit the completed review now as exactly one JSON object matching the schema.",
+  "Output only that object: no prose, no code fences, no progress updates, and no second copy.",
+  "Do not run any more tools — use the findings you already have."
+].join("\n");
+
+/** A parsed object is only useful as a review if it carries the review fields. */
+function looksLikeReviewResult(value) {
+  return (
+    Boolean(value) &&
+    typeof value === "object" &&
+    typeof value.verdict === "string" &&
+    typeof value.summary === "string" &&
+    Array.isArray(value.findings)
+  );
+}
+
+function parseReviewOutput(result) {
+  return parseStructuredOutput(result.finalMessage, {
+    status: result.status,
+    structuredOutput: result.structuredOutput,
+    segments: result.messageSegments,
+    stopReason: result.stopReason,
+    shapeCheck: looksLikeReviewResult,
+    failureMessage: result.error?.message ?? result.stderr
+  });
+}
+
 function buildNativeReviewTarget(target) {
   if (target.mode === "working-tree") {
     return { type: "uncommittedChanges" };
@@ -411,17 +440,37 @@ async function executeReviewRun(request) {
 
   const context = collectReviewContext(request.cwd, target);
   const prompt = buildAdversarialReviewPrompt(context, focusText);
-  const result = await runAppServerTurn(context.repoRoot, {
+  const schema = readOutputSchema(REVIEW_SCHEMA);
+  let result = await runAppServerTurn(context.repoRoot, {
     prompt,
     model: request.model,
     sandbox: "read-only",
-    outputSchema: readOutputSchema(REVIEW_SCHEMA),
+    outputSchema: schema,
     onProgress: request.onProgress
   });
-  const parsed = parseStructuredOutput(result.finalMessage, {
-    status: result.status,
-    failureMessage: result.error?.message ?? result.stderr
-  });
+  let parsed = parseReviewOutput(result);
+
+  // Grok narrates between tool calls, and under a JSON schema that narration is
+  // itself JSON. Parsing already recovers the real answer from a run of drafts,
+  // but if even that fails the session is still warm and its context cached —
+  // one short "re-emit the JSON" turn is far cheaper than losing the review.
+  if (!parsed.parsed && result.threadId) {
+    request.onProgress?.("Grok returned unusable JSON. Asking it to re-emit the final object.");
+    const retry = await runAppServerTurn(context.repoRoot, {
+      prompt: REVIEW_REEMIT_PROMPT,
+      resumeThreadId: result.threadId,
+      model: request.model,
+      sandbox: "read-only",
+      outputSchema: schema,
+      maxTurns: 1,
+      onProgress: request.onProgress
+    });
+    const retryParsed = parseReviewOutput(retry);
+    if (retryParsed.parsed) {
+      result = { ...retry, reasoningSummary: result.reasoningSummary };
+      parsed = retryParsed;
+    }
+  }
   const payload = {
     review: reviewName,
     target,
@@ -440,6 +489,8 @@ async function executeReviewRun(request) {
     result: parsed.parsed,
     rawOutput: parsed.rawOutput,
     parseError: parsed.parseError,
+    recovered: parsed.recovered ?? null,
+    stopReason: result.stopReason ?? null,
     reasoningSummary: result.reasoningSummary
   };
 
