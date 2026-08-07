@@ -19,6 +19,13 @@
   `result`, `cancel`, and `transfer` were marked `disable-model-invocation`, so Claude
   could only ask the user to type the slash command.
 - Trim the reasoning section in rendered results to a readable tail.
+- Stop `/grok:review` and `/grok:adversarial-review` blocking on a wait-vs-background
+  question. They now size the change themselves, say which mode they picked, and run.
+  Now that Claude can route a natural-language request to these commands, there is
+  nobody to answer that question and the review never ran at all.
+- Make the "your reply is the review" contract concrete in both review commands.
+  Claude was replying "That's the full Grok review output above, reproduced verbatim"
+  and delivering nothing, so the findings never reached the user.
 
 ## 1.0.0
 

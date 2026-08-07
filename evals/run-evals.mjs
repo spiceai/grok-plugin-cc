@@ -33,6 +33,42 @@ const CONFIGS = {
   baseline: { label: "baseline", loadPlugin: false }
 };
 
+/**
+ * Settings that switch off every plugin the developer has installed, so a
+ * session sees only what `--plugin-dir` gives it.
+ *
+ * Without this the harness silently measures the wrong thing. A `claude -p`
+ * subprocess inherits user settings, so an installed copy of this same plugin
+ * stays enabled even in the baseline config — which then runs the *released*
+ * plugin rather than no plugin at all, and quietly reports a pass rate for it.
+ * That also invalidates `no-hijack-trivial-task`, whose whole argument is that
+ * the baseline cannot reach Grok.
+ *
+ * `--settings` wins over user settings and leaves auth alone, which is why this
+ * is done here rather than by redirecting CLAUDE_CONFIG_DIR (that loses the
+ * login and every session fails).
+ */
+function buildPluginIsolationSettings() {
+  const disabled = {};
+  // Known provider surfaces, in case the settings file cannot be read at all.
+  for (const name of ["grok@spicehq", "codex@spicehq"]) {
+    disabled[name] = false;
+  }
+  for (const dir of [process.env.CLAUDE_CONFIG_DIR, path.join(os.homedir(), ".claude")].filter(Boolean)) {
+    try {
+      const settings = JSON.parse(fs.readFileSync(path.join(dir, "settings.json"), "utf8"));
+      for (const name of Object.keys(settings.enabledPlugins ?? {})) {
+        disabled[name] = false;
+      }
+    } catch {
+      // No readable settings file here; the defaults above still apply.
+    }
+  }
+  return JSON.stringify({ enabledPlugins: disabled });
+}
+
+const PLUGIN_ISOLATION_SETTINGS = buildPluginIsolationSettings();
+
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   const provider = PROVIDERS[options.provider];
@@ -123,7 +159,12 @@ async function runOne(evalDef, config, runDir, options) {
     "--permission-mode",
     "bypassPermissions",
     "--output-format",
-    "json"
+    "json",
+    // Both configs, not just baseline: with an installed copy also enabled it is
+    // ambiguous which one served the session, so the with-plugin column stops
+    // being a measurement of the working tree.
+    "--settings",
+    PLUGIN_ISOLATION_SETTINGS
   ];
   if (config.loadPlugin) {
     baseArgs.push("--plugin-dir", provider.pluginDir);

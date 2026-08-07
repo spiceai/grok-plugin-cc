@@ -24,7 +24,15 @@ Each eval is one real `claude -p` session:
    and then execs the real Grok Build CLI with stdio passed straight through.
    Grok does all the real work; we just get to see exactly what the plugin asked
    it to do.
-3. `claude -p` runs in that repo with `--plugin-dir plugins/grok`.
+3. `claude -p` runs in that repo with `--plugin-dir plugins/grok`, and with
+   `--settings` switching off every plugin installed on the developer's machine.
+   That isolation is load-bearing, not hygiene: a `claude -p` subprocess
+   inherits user settings, so a released copy of this same plugin stays enabled
+   even in the baseline config. Left alone, "baseline" silently measures the
+   *installed* plugin instead of no plugin, and it is ambiguous which copy
+   served the with-plugin column. This was a real bug — an earlier run scored
+   `baseline` 34/36 with the rescue subagent spawning and Grok invoked, which is
+   impossible without a plugin.
 4. Three independent sources are collected and graded: the main session
    transcript, the rescue subagent's own transcript, and the Grok argv trace.
 
@@ -72,8 +80,9 @@ iteration you get `benchmark.json` and `benchmark.md`.
 | `nl-readonly-diagnose` | flags | "diagnose only, don't change anything" still gets `--always-approve` and Grok edits the user's code. |
 | `slash-rescue-flag-mapping` | flags | `build` never becomes `grok-build`; `--effort` is dropped; routing flags leak into the prompt text Grok reads as task content. |
 | `slash-review-no-autofix` | review discipline | Claude helpfully "fixes" what the review found. This is the one rule `grok-result-handling` marks CRITICAL, and it is exactly the kind of instruction models soften over time. |
+| `slash-adversarial-review-structured` | review discipline | The structured-output path breaking. Grok narrates between tool calls, and under `--json-schema` that narration is itself JSON, so a whole-stream parse sees several objects glued together and reports a malformed review even though the run succeeded. |
 | `no-hijack-trivial-task` | routing | Over-triggering. A one-line JSDoc comment gets shipped to Grok, making the plugin feel slow and expensive. |
-| `nl-review-routing` | routing | `/grok:review` sets `disable-model-invocation`, so a natural-language review request cannot reach it. Claude must either route through rescue or name the command — silently reviewing the code itself is the failure. |
+| `nl-review-routing` | routing | A natural-language review request that never produces a review. Claude must actually get Grok to review — reviewing the code itself is the failure, and so is stalling on a wait-vs-background question that nobody is there to answer. |
 
 Forwarder discipline is graded inside the rescue evals rather than as its own
 case, because it is only observable when a delegation actually happens: exactly

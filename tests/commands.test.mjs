@@ -11,13 +11,11 @@ function read(relativePath) {
   return fs.readFileSync(path.join(PLUGIN_ROOT, relativePath), "utf8");
 }
 
-test("review command uses AskUserQuestion and background Bash while staying review-only", () => {
+test("review command decides its own execution mode while staying review-only", () => {
   const source = read("commands/review.md");
-  assert.match(source, /AskUserQuestion/);
   assert.match(source, /\bBash\(/);
   assert.match(source, /Do not fix issues/i);
   assert.match(source, /review-only/i);
-  assert.match(source, /return Grok's output verbatim to the user/i);
   assert.match(source, /```bash/);
   assert.match(source, /```typescript/);
   assert.match(source, /review "\$ARGUMENTS"/);
@@ -26,28 +24,22 @@ test("review command uses AskUserQuestion and background Bash while staying revi
   assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/grok-companion\.mjs" review "\$ARGUMENTS"`/);
   assert.match(source, /description:\s*"Grok review"/);
   assert.match(source, /Do not call `BashOutput`/);
-  assert.match(source, /Reproduce the command stdout in your reply, exactly as-is/i);
-  // The user never sees Bash output, so "shown above" silently loses the review.
-  assert.match(source, /user does not see Bash output/i);
   assert.match(source, /git status --short --untracked-files=all/);
   assert.match(source, /git diff --shortstat/);
   assert.match(source, /Treat untracked files or directories as reviewable work/i);
-  assert.match(source, /Recommend waiting only when the review is clearly tiny, roughly 1-2 files total/i);
-  assert.match(source, /In every other case, including unclear size, recommend background/i);
+  assert.match(source, /Run in the foreground when the review is clearly tiny, roughly 1-2 files total/i);
+  assert.match(source, /In every other case, including unclear size, run it in the background/i);
   assert.match(source, /The companion script parses `--wait` and `--background`/i);
   assert.match(source, /Claude Code's `Bash\(..., run_in_background: true\)` is what actually detaches the run/i);
   assert.match(source, /When in doubt, run the review/i);
-  assert.match(source, /\(Recommended\)/);
   assert.match(source, /does not support staged-only review, unstaged-only review, or extra focus text/i);
 });
 
-test("adversarial review command uses AskUserQuestion and background Bash while staying review-only", () => {
+test("adversarial review command decides its own execution mode while staying review-only", () => {
   const source = read("commands/adversarial-review.md");
-  assert.match(source, /AskUserQuestion/);
   assert.match(source, /\bBash\(/);
   assert.match(source, /Do not fix issues/i);
   assert.match(source, /review-only/i);
-  assert.match(source, /return Grok's output verbatim to the user/i);
   assert.match(source, /```bash/);
   assert.match(source, /```typescript/);
   assert.match(source, /adversarial-review "\$ARGUMENTS"/);
@@ -56,16 +48,38 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
   assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/grok-companion\.mjs" adversarial-review "\$ARGUMENTS"`/);
   assert.match(source, /description:\s*"Grok adversarial review"/);
   assert.match(source, /Do not call `BashOutput`/);
-  assert.match(source, /Reproduce the command stdout in your reply, exactly as-is/i);
-  // The user never sees Bash output, so "shown above" silently loses the review.
-  assert.match(source, /user does not see Bash output/i);
   assert.match(source, /git status --short --untracked-files=all/);
   assert.match(source, /git diff --shortstat/);
   assert.match(source, /Treat untracked files or directories as reviewable work/i);
   assert.match(source, /When in doubt, run the review/i);
-  assert.match(source, /\(Recommended\)/);
   assert.match(source, /uses the same review target selection as `\/grok:review`/i);
   assert.match(source, /can still take extra focus text after the flags/i);
+});
+
+/**
+ * Both regressions the eval suite caught, pinned so they cannot come back.
+ *
+ * Blocking on a question strands the review: these commands are reached both by
+ * a user typing them and by Claude routing a natural-language request, and in
+ * the routed case nobody answers, so Grok never runs at all.
+ *
+ * The output contract needs to name the exact failure, because the abstract
+ * version did not hold — Claude replied "That's the full Grok review output
+ * above, reproduced verbatim" and delivered nothing.
+ */
+test("review commands neither stall on a question nor point at collapsed output", () => {
+  for (const file of ["commands/review.md", "commands/adversarial-review.md"]) {
+    const source = read(file);
+    assert.match(source, /act on that judgement — do not stop to ask/i, `${file} must not block on a confirmation`);
+    assert.doesNotMatch(
+      source,
+      /use `AskUserQuestion`/i,
+      `${file} still asks before running, which strands a routed review`
+    );
+    assert.match(source, /reproduced verbatim/i, `${file} must name the exact failing reply`);
+    assert.match(source, /Claiming you reproduced it is not reproducing it/i);
+    assert.match(source, /must literally begin with the first line/i);
+  }
 });
 
 test("continue is not exposed as a user-facing command", () => {
