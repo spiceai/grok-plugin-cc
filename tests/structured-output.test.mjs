@@ -152,6 +152,28 @@ test("an early truncation reports the stop reason instead of a generic parse err
   assert.match(parsed.parseError, /cut off/i);
 });
 
+/**
+ * Repair closes whatever containers were left open, which for an answer cut off
+ * before any finding was written means inventing an empty `findings: []`. The
+ * companion refuses that shape; these pin the distinction repair itself makes.
+ */
+test("salvage keeps findings that were genuinely emitted before the cut", () => {
+  const serialized = JSON.stringify(REVIEW);
+  const truncated = serialized.slice(0, serialized.indexOf("Reserve before") + 6);
+
+  const parsed = parseStructuredOutput(truncated, { stopReason: "max_tokens" });
+
+  assert.equal(parsed.recovered, "truncated-json");
+  assert.equal(parsed.parsed.findings.length, 1, "the finding written before the cut must survive");
+});
+
+test("salvage of an answer cut off before any finding yields an empty list, not a verdict", () => {
+  const parsed = parseStructuredOutput('{"verdict":"approve","summary":"No issues","findings":[', {});
+
+  assert.equal(parsed.recovered, "truncated-json");
+  assert.deepEqual(parsed.parsed.findings, [], "repair can only close the array it was given");
+});
+
 test("empty output reports the underlying failure", () => {
   const parsed = parseStructuredOutput("", { failureMessage: "grok exited with code 1" });
 

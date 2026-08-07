@@ -235,6 +235,30 @@ if (BEHAVIOR === "review-truncated") {
   process.exit(0);
 }
 
+if (BEHAVIOR === "review-truncated-allclear") {
+  // Cut off before a single finding was written. Repair can only close the
+  // empty array, which would read as a clean approval the model never gave.
+  if (parsed.flags.resume) {
+    emit({ type: "text", data: JSON.stringify(REVIEW_OBJECT) });
+    emit({ type: "end", stopReason: "end_turn", sessionId, requestId: "req-fake" });
+  } else {
+    emit({ type: "text", data: '{"verdict":"approve","summary":"No issues","findings":[' });
+    emit({ type: "end", stopReason: "end_turn", sessionId, requestId: "req-fake" });
+  }
+  state.sessions.push(sessionId);
+  saveState(state);
+  process.exit(0);
+}
+
+if (BEHAVIOR === "killed-mid-run") {
+  // A process that dies from a signal reports a null exit code, which must not
+  // read as success — /grok:cancel kills the tree exactly this way.
+  emit({ type: "text", data: '{"verdict":"approve","summary":"partial' });
+  process.kill(process.pid, "SIGTERM");
+  setTimeout(() => process.exit(0), 1000);
+  return;
+}
+
 if (BEHAVIOR === "review-reemit") {
   // First run emits nothing parseable at all; the resumed run emits the object.
   if (parsed.flags.resume) {

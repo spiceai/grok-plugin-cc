@@ -9,8 +9,13 @@
 - Prefer the schema-validated `structuredOutput` that Grok reports on its `end` event
   instead of re-parsing the text stream.
 - Recover reviews whose JSON was cut off by the output-token budget, keeping every
-  finding emitted before the cut and flagging the result as partial.
-- Retry once, on the same Grok session, when a review still produces nothing parseable.
+  finding emitted before the cut and flagging the result as partial. A recovered
+  review never reports a clean approval: when the cut lands before any finding,
+  repair can only produce an empty findings list, and reporting that as "no issues
+  found" would be an all-clear Grok never gave.
+- Retry once, on the same Grok session, when a review produces nothing parseable or
+  had to be repaired — a restated answer is something Grok actually said, where a
+  repaired one is partly inferred.
 - Tell Grok in the review prompt to emit its JSON exactly once, and bound findings and
   field lengths in the review schema so long reviews cannot blow the output budget.
 - Fix the stop-time review gate reading Grok's opening narration as its verdict; it now

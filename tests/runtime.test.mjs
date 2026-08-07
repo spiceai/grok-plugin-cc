@@ -186,6 +186,48 @@ test("adversarial review salvages findings from output cut off by the token budg
   assert.equal(payload.result.verdict, "needs-attention");
 });
 
+/**
+ * Repairing a half-written answer can only close the containers it was given.
+ * When the cut lands before any finding, that produces a clean approval with an
+ * empty findings list — an all-clear the model never gave, and the worst
+ * possible thing for a review tool to report. It must never be the answer.
+ */
+test("adversarial review refuses a salvaged all-clear and restates the review instead", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-truncated-allclear");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+
+  assert.notEqual(payload.result?.verdict, "approve", "a repaired empty approval must not be reported as the verdict");
+  assert.equal(payload.result.findings.length, 1, "the restated review should have replaced the salvage");
+  assert.equal(payload.parseError, null);
+});
+
+/**
+ * Node reports a null exit code when a child dies from a signal, which is
+ * exactly how /grok:cancel stops a run. Treating that as success would store the
+ * partial output as a completed review.
+ */
+test("a grok process killed by a signal is reported as a failure, not a completed run", async () => {
+  const { runGrokTurn } = await import("../plugins/grok/scripts/lib/grok.mjs");
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "killed-mid-run");
+  const env = buildEnv(binDir);
+  const cwd = prepareRepo();
+
+  const result = await runGrokTurn(cwd, { prompt: "review this", env });
+
+  assert.equal(result.status, 1, "a signalled run must not report success");
+  assert.equal(result.exitCode, null, "signalled processes report a null exit code");
+  assert.ok(result.exitSignal, "the signal should be retained");
+  assert.match(result.error.message, /signal/i);
+});
+
 test("adversarial review asks grok to re-emit when nothing parses", () => {
   const binDir = makeTempDir();
   installFakeGrok(binDir, "review-reemit");

@@ -397,7 +397,11 @@ export async function runGrokTurn(cwd, options = {}) {
     let errorMessage = null;
     let settled = false;
     let streamEnded = false;
+    // `exitCode` is null for a signalled process, so it cannot double as the
+    // "has the child closed yet" flag.
+    let childClosed = false;
     let exitCode = null;
+    let exitSignal = null;
     let pendingThought = "";
 
     const closeSegment = () => {
@@ -544,7 +548,7 @@ export async function runGrokTurn(cwd, options = {}) {
     // came for. Settle only once the process has exited *and* readline has
     // drained every buffered line.
     const settle = () => {
-      if (settled || !streamEnded || exitCode === null) {
+      if (settled || !streamEnded || !childClosed) {
         return;
       }
       settled = true;
@@ -553,6 +557,10 @@ export async function runGrokTurn(cwd, options = {}) {
       closeSegment();
 
       const cleaned = cleanStderr(stderr);
+      // A signalled process reports a null exit code, so anything that is not a
+      // clean 0 is a failure. Treating null as success would make a cancelled
+      // run — /grok:cancel kills the process tree — look like it completed, and
+      // store whatever partial output it had managed to emit as the result.
       const status = exitCode === 0 && !errorMessage ? 0 : 1;
       const finalSegment = messageSegments.length > 0 ? messageSegments[messageSegments.length - 1] : "";
       // Segments are separate assistant messages. Joining them bare ran the last
@@ -573,9 +581,13 @@ export async function runGrokTurn(cwd, options = {}) {
         reasoningSummary,
         error: errorMessage
           ? { message: errorMessage }
-          : exitCode && exitCode !== 0
-            ? { message: cleaned || `grok exited with code ${exitCode}` }
-            : null,
+          : exitSignal
+            ? { message: cleaned || `grok was terminated by signal ${exitSignal}` }
+            : exitCode !== 0
+              ? { message: cleaned || `grok exited with code ${exitCode}` }
+              : null,
+        exitCode,
+        exitSignal,
         stderr: cleaned,
         fileChanges: [],
         touchedFiles: collectTouchedFilesFromEvents(events),
@@ -590,8 +602,10 @@ export async function runGrokTurn(cwd, options = {}) {
       settle();
     });
 
-    child.on("close", (code) => {
-      exitCode = code ?? 0;
+    child.on("close", (code, signal) => {
+      exitCode = code;
+      exitSignal = signal;
+      childClosed = true;
       settle();
     });
   });
