@@ -1,7 +1,6 @@
 ---
-description: Run a Grok review that challenges the implementation approach and design choices
+description: Run a Grok review that challenges the implementation approach and design choices, returning structured findings by severity. Use when the user wants a harsher, adversarial, or skeptical Grok review, wants the design or approach challenged rather than just the code checked, or wants a Grok review focused on a specific concern such as auth, races, or data loss.
 argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [focus ...]'
-disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
 
@@ -15,24 +14,29 @@ Raw slash-command arguments:
 Core constraint:
 - This command is review-only.
 - Do not fix issues, apply patches, or suggest that you are about to make changes.
-- Your only job is to run the review and return Grok's output verbatim to the user.
+- Your only job is to run the review and put Grok's output in front of the user.
 - Keep the framing focused on whether the current approach is the right one, what assumptions it depends on, and where the design could fail under real-world conditions.
 
+Your reply is the only thing the user sees:
+- Bash results are collapsed in the transcript. The user cannot read them.
+- So a reply that refers to the output instead of containing it delivers nothing, and the review — which cost real time and money — is lost.
+- Concretely, replies like "That's the full Grok review output above, reproduced verbatim", "the review is above", or "output shown above" are the failure. Claiming you reproduced it is not reproducing it.
+- Your reply must literally begin with the first line of the companion's stdout and carry the whole thing through, including every finding.
+
 Execution mode rules:
-- If the raw arguments include `--wait`, do not ask. Run in the foreground.
-- If the raw arguments include `--background`, do not ask. Run in a Claude background task.
-- Otherwise, estimate the review size before asking:
+- If the raw arguments include `--wait`, run in the foreground.
+- If the raw arguments include `--background`, run in a Claude background task.
+- Otherwise, size the review yourself and act on that judgement — do not stop to ask:
   - For working-tree review, start with `git status --short --untracked-files=all`.
   - For working-tree review, also inspect both `git diff --shortstat --cached` and `git diff --shortstat`.
   - For base-branch review, use `git diff --shortstat <base>...HEAD`.
   - Treat untracked files or directories as reviewable work for auto or working-tree review even when `git diff --shortstat` is empty.
   - Only conclude there is nothing to review when the relevant scope is actually empty.
-  - Recommend waiting only when the scoped review is clearly tiny, roughly 1-2 files total and no sign of a broader directory-sized change.
-  - In every other case, including unclear size, recommend background.
+  - Run in the foreground when the scoped review is clearly tiny, roughly 1-2 files total and no sign of a broader directory-sized change.
+  - In every other case, including unclear size, run it in the background.
   - When in doubt, run the review instead of declaring that there is nothing to review.
-- Then use `AskUserQuestion` exactly once with two options, putting the recommended option first and suffixing its label with `(Recommended)`:
-  - `Wait for results`
-  - `Run in background`
+- Say which mode you picked and how to override it, in one short line, then proceed in the same turn.
+- Asking first and waiting for an answer strands the review: this command is reached both by a user typing it and by Claude routing a natural-language request to it, and in the routed case there is nobody to answer, so the review never runs at all. Picking the sensible default and saying so costs the user nothing and always produces a review.
 
 Argument handling:
 - Preserve the user's arguments exactly.
@@ -49,8 +53,8 @@ Foreground flow:
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-companion.mjs" adversarial-review "$ARGUMENTS"
 ```
-- Reproduce the command stdout in your reply, exactly as-is.
-- The user does not see Bash output. Tool results are collapsed in the transcript, so pointing at it — "the review is above", "output shown above" — leaves them with a blank screen and the review effectively lost. Copying it into your reply is the only way it reaches them.
+- Copy the command's stdout into your reply, exactly as-is. Start your reply with its first line.
+- The user does not see Bash output, so this copy is the review as far as they are concerned. Re-read the "Your reply is the only thing the user sees" rules above before you answer.
 - Do not paraphrase, summarize, or add commentary before or after it.
 - Do not fix any issues mentioned in the review output.
 

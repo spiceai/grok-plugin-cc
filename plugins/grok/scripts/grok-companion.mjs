@@ -259,6 +259,64 @@ function ensureGrokAvailable(cwd) {
   }
 }
 
+const REVIEW_REEMIT_PROMPT = [
+  "Your previous answer could not be read as a single JSON object.",
+  "Re-emit the completed review now as exactly one JSON object matching the schema.",
+  "Output only that object: no prose, no code fences, no progress updates, and no second copy.",
+  "Do not run any more tools — use the findings you already have."
+].join("\n");
+
+/** A parsed object is only useful as a review if it carries the review fields. */
+function looksLikeReviewResult(value) {
+  return (
+    Boolean(value) &&
+    typeof value === "object" &&
+    typeof value.verdict === "string" &&
+    typeof value.summary === "string" &&
+    Array.isArray(value.findings)
+  );
+}
+
+/**
+ * A salvaged review is only worth keeping when the findings it reports were
+ * genuinely emitted before the output was cut off.
+ *
+ * Closing the delimiters of `{"verdict":"approve","summary":"…","findings":[`
+ * yields a clean approval with an empty findings list — an all-clear the model
+ * never gave. Every other salvage reports findings that really were written, so
+ * this rejects the one shape where repair invents the conclusion rather than
+ * recovering it.
+ */
+function isFabricatedAllClear(parsed) {
+  return (
+    Array.isArray(parsed?.findings) &&
+    parsed.findings.length === 0 &&
+    !/needs.?attention|block|reject/i.test(String(parsed?.verdict ?? ""))
+  );
+}
+
+function parseReviewOutput(result) {
+  const parsed = parseStructuredOutput(result.finalMessage, {
+    status: result.status,
+    structuredOutput: result.structuredOutput,
+    segments: result.messageSegments,
+    stopReason: result.stopReason,
+    shapeCheck: looksLikeReviewResult,
+    failureMessage: result.error?.message ?? result.stderr
+  });
+
+  if (parsed.recovered && isFabricatedAllClear(parsed.parsed)) {
+    return {
+      ...parsed,
+      parsed: null,
+      parseError:
+        "Grok's review was cut off before it reported anything, so the only thing left to recover was an empty approval. Treating that as 'no issues found' would be wrong."
+    };
+  }
+
+  return parsed;
+}
+
 function buildNativeReviewTarget(target) {
   if (target.mode === "working-tree") {
     return { type: "uncommittedChanges" };
@@ -411,17 +469,53 @@ async function executeReviewRun(request) {
 
   const context = collectReviewContext(request.cwd, target);
   const prompt = buildAdversarialReviewPrompt(context, focusText);
-  const result = await runAppServerTurn(context.repoRoot, {
+  const schema = readOutputSchema(REVIEW_SCHEMA);
+  let result = await runAppServerTurn(context.repoRoot, {
     prompt,
     model: request.model,
     sandbox: "read-only",
-    outputSchema: readOutputSchema(REVIEW_SCHEMA),
+    outputSchema: schema,
     onProgress: request.onProgress
   });
-  const parsed = parseStructuredOutput(result.finalMessage, {
-    status: result.status,
-    failureMessage: result.error?.message ?? result.stderr
-  });
+  let parsed = parseReviewOutput(result);
+
+  // Grok narrates between tool calls, and under a JSON schema that narration is
+  // itself JSON. Parsing already recovers the real answer from a run of drafts,
+  // but if even that fails the session is still warm and its context cached —
+  // one short "re-emit the JSON" turn is far cheaper than losing the review.
+  //
+  // A salvaged object counts as "still needs the retry". Closing the delimiters
+  // of a half-written answer produces something that parses but was never
+  // actually asserted: `{"verdict":"approve","summary":"No issues","findings":[`
+  // repairs into a clean approval with no findings, which is the most dangerous
+  // possible output for a review tool. Asking Grok to restate its answer costs
+  // one cheap turn and yields something it actually said, so the salvage is only
+  // kept when the retry cannot do better.
+  if ((!parsed.parsed || parsed.recovered) && result.threadId) {
+    request.onProgress?.(
+      parsed.recovered
+        ? "Grok's JSON was incomplete and had to be repaired. Asking it to restate the review."
+        : "Grok returned unusable JSON. Asking it to re-emit the final object."
+    );
+    const retry = await runAppServerTurn(context.repoRoot, {
+      prompt: REVIEW_REEMIT_PROMPT,
+      resumeThreadId: result.threadId,
+      model: request.model,
+      sandbox: "read-only",
+      outputSchema: schema,
+      maxTurns: 1,
+      onProgress: request.onProgress
+    });
+    const retryParsed = parseReviewOutput(retry);
+    // Take the retry when it is a clean parse. When it also had to be salvaged
+    // it is no more trustworthy than what we already had, so it only wins if the
+    // first attempt produced nothing usable at all.
+    const retryIsBetter = retryParsed.parsed && (!retryParsed.recovered || !parsed.parsed);
+    if (retryIsBetter) {
+      result = { ...retry, reasoningSummary: result.reasoningSummary };
+      parsed = retryParsed;
+    }
+  }
   const payload = {
     review: reviewName,
     target,
@@ -440,6 +534,8 @@ async function executeReviewRun(request) {
     result: parsed.parsed,
     rawOutput: parsed.rawOutput,
     parseError: parsed.parseError,
+    recovered: parsed.recovered ?? null,
+    stopReason: result.stopReason ?? null,
     reasoningSummary: result.reasoningSummary
   };
 

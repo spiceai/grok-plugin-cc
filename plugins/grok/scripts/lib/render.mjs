@@ -163,14 +163,27 @@ function pushJobDetails(lines, job, options = {}) {
   }
 }
 
+// A long agent run produces hundreds of reasoning fragments. Dumping them all
+// buries the findings the user actually asked for, so keep a readable tail.
+const MAX_REASONING_ENTRIES = 8;
+const MAX_REASONING_CHARS = 240;
+
 function appendReasoningSection(lines, reasoningSummary) {
   if (!Array.isArray(reasoningSummary) || reasoningSummary.length === 0) {
     return;
   }
 
-  lines.push("", "Reasoning:");
-  for (const section of reasoningSummary) {
-    lines.push(`- ${section}`);
+  const sections = reasoningSummary.filter((section) => String(section ?? "").trim());
+  if (sections.length === 0) {
+    return;
+  }
+
+  const shown = sections.slice(-MAX_REASONING_ENTRIES);
+  const hidden = sections.length - shown.length;
+  lines.push("", hidden > 0 ? `Reasoning (last ${shown.length} of ${sections.length}):` : "Reasoning:");
+  for (const section of shown) {
+    const text = String(section).trim().replace(/\s+/g, " ");
+    lines.push(`- ${text.length > MAX_REASONING_CHARS ? `${text.slice(0, MAX_REASONING_CHARS - 3)}...` : text}`);
   }
 }
 
@@ -254,10 +267,14 @@ export function renderReviewResult(parsedResult, meta) {
     "",
     `Target: ${meta.targetLabel}`,
     `Verdict: ${data.verdict}`,
-    "",
-    data.summary,
     ""
   ];
+
+  if (parsedResult.recovered === "truncated-json") {
+    lines.push("Note: Grok's output was cut off, so this review was recovered from the partial answer and may be incomplete.", "");
+  }
+
+  lines.push(data.summary, "");
 
   if (findings.length === 0) {
     lines.push("No material findings.");

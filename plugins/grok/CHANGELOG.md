@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.0.1
+
+- Fix reviews failing with "Grok did not return valid structured JSON". Grok narrates
+  between tool calls, and under a JSON schema that narration is itself JSON, so the
+  captured output was several complete objects glued together. Assistant messages are
+  now tracked as separate segments and the final one is used as the answer.
+- Prefer the schema-validated `structuredOutput` that Grok reports on its `end` event
+  instead of re-parsing the text stream.
+- Recover reviews whose JSON was cut off by the output-token budget, keeping every
+  finding emitted before the cut and flagging the result as partial. A recovered
+  review never reports a clean approval: when the cut lands before any finding,
+  repair can only produce an empty findings list, and reporting that as "no issues
+  found" would be an all-clear Grok never gave.
+- Retry once, on the same Grok session, when a review produces nothing parseable or
+  had to be repaired — a restated answer is something Grok actually said, where a
+  repaired one is partly inferred.
+- Tell Grok in the review prompt to emit its JSON exactly once, and bound findings and
+  field lengths in the review schema so long reviews cannot blow the output budget.
+- Fix the stop-time review gate reading Grok's opening narration as its verdict; it now
+  uses the last `ALLOW:`/`BLOCK:` line.
+- Let Claude invoke the Grok commands itself. `review`, `adversarial-review`, `status`,
+  `result`, `cancel`, and `transfer` were marked `disable-model-invocation`, so Claude
+  could only ask the user to type the slash command.
+- Trim the reasoning section in rendered results to a readable tail.
+- Stop `/grok:review` and `/grok:adversarial-review` blocking on a wait-vs-background
+  question. They now size the change themselves, say which mode they picked, and run.
+  Now that Claude can route a natural-language request to these commands, there is
+  nobody to answer that question and the review never ran at all.
+- Make the "your reply is the review" contract concrete in both review commands.
+  Claude was replying "That's the full Grok review output above, reproduced verbatim"
+  and delivering nothing, so the findings never reached the user.
+
 ## 1.0.0
 
 - Initial release of the Grok Build plugin for Claude Code.

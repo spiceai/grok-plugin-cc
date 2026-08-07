@@ -78,10 +78,10 @@
           ]
         },
         {
-          "id": "returns-companion-output-verbatim",
-          "text": "Final response carries the companion's Grok output through to the user",
+          "id": "output-reaches-the-user",
+          "text": "Final response tells the user what Grok changed and where, rather than pointing at collapsed tool output",
           "check": "response_matches",
-          "pattern": "\\[grok\\]"
+          "pattern": "cache\\.js|expiresAt|ttlMs|TTL"
         },
         {
           "id": "bug-actually-fixed",
@@ -263,6 +263,76 @@
       ]
     },
     {
+      "id": "slash-adversarial-review-structured",
+      "name": "Adversarial review returns findings the plugin can actually parse",
+      "dimension": "review-discipline",
+      "fixture": "ttl-cache",
+      "prompt": "/grok:adversarial-review --wait focus on the cache expiry logic",
+      "expected_output": "Grok runs once under the JSON schema, the companion parses its structured answer without falling back to a parse error, and the findings reach the user. Nothing on disk changes.",
+      "assertions": [
+        {
+          "id": "invokes-grok-exactly-once",
+          "text": "Invokes the Grok CLI exactly once",
+          "check": "grok_turns",
+          "equals": 1
+        },
+        {
+          "id": "grok-run-actually-started",
+          "text": "The Grok run starts instead of dying on a CLI/sandbox rejection",
+          "check": "helper_output_not_matches",
+          "pattern": "refusing to start|could not apply the '|sandbox could not be applied|sandbox profile '[^']*' not found"
+        },
+        {
+          "id": "uses-the-structured-output-schema",
+          "text": "Drives the run through Grok's structured-output mode, which is what separates adversarial review from native review",
+          "check": "grok_argv_sequence",
+          "tokens": [
+            "--json-schema"
+          ]
+        },
+        {
+          "id": "structured-output-parsed",
+          "text": "The companion parses Grok's answer instead of reporting malformed JSON. Grok narrates between tool calls, and under a schema that narration is itself JSON, so a whole-stream parse sees several objects glued together and fails.",
+          "check": "helper_output_not_matches",
+          "pattern": "did not return valid structured JSON|Could not parse structured JSON|unexpected review shape|Grok did not return a final structured message"
+        },
+        {
+          "id": "review-runs-read-only",
+          "text": "Blocks Grok's edit tools for a review",
+          "check": "grok_write_capability",
+          "expect": "read-only"
+        },
+        {
+          "id": "no-files-modified",
+          "text": "Leaves every file in the repository untouched",
+          "check": "files_unchanged"
+        },
+        {
+          "id": "no-edit-tools-used",
+          "text": "Claude never invokes a file-editing tool during or after the review",
+          "check": "main_tools_absent",
+          "tools": [
+            "Edit",
+            "Write",
+            "MultiEdit",
+            "NotebookEdit"
+          ]
+        },
+        {
+          "id": "grok-finds-the-real-defect",
+          "text": "Grok's adversarial review identifies the TTL/expiresAt defect",
+          "check": "helper_output_matches",
+          "pattern": "expiresAt|ttlMs|TTL"
+        },
+        {
+          "id": "findings-reach-the-user",
+          "text": "Those findings appear in the user-visible response, not only in the collapsed tool result",
+          "check": "response_matches",
+          "pattern": "expiresAt|ttlMs|TTL"
+        }
+      ]
+    },
+    {
       "id": "no-hijack-trivial-task",
       "name": "Trivial local edits are not handed off to Grok",
       "dimension": "routing",
@@ -298,22 +368,19 @@
       "dimension": "routing",
       "fixture": "ttl-cache",
       "prompt": "can grok look over my uncommitted changes and tell me if anything looks wrong?",
-      "expected_output": "Because /grok:review sets disable-model-invocation, Claude cannot call it directly. Either it routes the review through the rescue subagent, or it tells the user to run /grok:review. What it must not do is silently review the code itself.",
+      "expected_output": "Claude routes the request to Grok and a review actually runs — either through /grok:review or through the rescue subagent. Reviewing the code itself is a failure, and so is answering with an offer to run the review later.",
       "assertions": [
         {
-          "id": "grok-involved-or-command-surfaced",
-          "text": "Either Grok actually runs, or the user is pointed at /grok:review",
-          "check": "any_of",
-          "checks": [
-            {
-              "check": "grok_turns",
-              "min": 1
-            },
-            {
-              "check": "response_matches",
-              "pattern": "/grok:review"
-            }
-          ]
+          "id": "review-actually-runs",
+          "text": "Grok actually reviews the changes instead of Claude offering to do it later",
+          "check": "grok_turns",
+          "min": 1
+        },
+        {
+          "id": "findings-reach-the-user",
+          "text": "The review reaches the user rather than stopping at a question or a collapsed tool result",
+          "check": "response_matches",
+          "pattern": "expiresAt|ttlMs|TTL|cache\\.js"
         },
         {
           "id": "no-files-modified",

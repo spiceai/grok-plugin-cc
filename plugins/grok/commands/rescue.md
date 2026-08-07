@@ -1,5 +1,5 @@
 ---
-description: Delegate investigation, an explicit fix request, or follow-up rescue work to the Grok rescue subagent
+description: Hand a coding, debugging, or investigation task to Grok and return its answer. Use whenever the user wants Grok to do the work — "ask grok", "have grok fix this", "get grok to look at it", "let grok try", "hand this to grok" — or asks to continue, resume, or dig deeper on previous Grok rescue work.
 argument-hint: "[--background|--wait] [--resume|--fresh] [--model <model|build>] [--effort <none|minimal|low|medium|high|xhigh>] [what Grok should investigate, solve, or continue]"
 allowed-tools: Bash(node:*), AskUserQuestion, Agent
 ---

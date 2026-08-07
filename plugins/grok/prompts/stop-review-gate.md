@@ -17,6 +17,7 @@ Your first line must be exactly one of:
 - ALLOW: <short reason>
 - BLOCK: <short reason>
 Do not put anything before that first line.
+Emit that verdict line exactly once, in your final message. Everything you say during the run is captured, so a verdict written mid-investigation competes with the real one.
 </compact_output_contract>
 
 <default_follow_through_policy>

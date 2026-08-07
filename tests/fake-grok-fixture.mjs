@@ -163,6 +163,128 @@ if (parsed.flags.outputFormat === "json") {
 }
 
 // streaming-json
+const REVIEW_OBJECT = {
+  verdict: "needs-attention",
+  summary: "Found one material issue in the change set.",
+  findings: [
+    {
+      severity: "high",
+      title: "Missing null check",
+      body: "The new parser assumes input is always present.",
+      file: "src/main.ts",
+      line_start: 12,
+      line_end: 18,
+      confidence: 0.9,
+      recommendation: "Guard against null input before parsing."
+    }
+  ],
+  next_steps: ["Add a unit test for empty input."]
+};
+
+function emitDraftedReview() {
+  // Grok narrates between tool calls; under a JSON schema that narration is
+  // itself JSON, so the run emits several complete objects before the real one.
+  const drafts = [
+    { verdict: "needs-attention", summary: "Review in progress.", findings: [], next_steps: [] },
+    { verdict: "needs-attention", summary: "Still digging into the diff.", findings: [], next_steps: [] }
+  ];
+  drafts.forEach((draft, index) => {
+    emit({ type: "text", data: JSON.stringify(draft) });
+    emit({
+      type: "tool_call",
+      toolCallId: "draft_" + index,
+      title: "Grep",
+      kind: "search",
+      status: "in_progress",
+      toolName: "grep",
+      rawInput: { pattern: "parse" }
+    });
+    emit({ type: "tool_call_update", toolCallId: "draft_" + index, status: "completed", toolName: "grep" });
+  });
+  const serialized = JSON.stringify(REVIEW_OBJECT);
+  emit({ type: "text", data: serialized.slice(0, 40) });
+  emit({ type: "text", data: serialized.slice(40) });
+  emit({ type: "end", stopReason: "end_turn", sessionId, requestId: "req-fake" });
+}
+
+if (BEHAVIOR === "review-drafts") {
+  emitDraftedReview();
+  state.sessions.push(sessionId);
+  saveState(state);
+  process.exit(0);
+}
+
+if (BEHAVIOR === "review-structured") {
+  // The text stream is unusable, but grok validated the answer itself.
+  emit({ type: "text", data: "Working on it..." });
+  emit({ type: "tool_call", toolCallId: "c1", title: "Read", kind: "read", status: "in_progress", toolName: "read_file", rawInput: { path: "src/main.ts" } });
+  emit({ type: "tool_call_update", toolCallId: "c1", status: "completed", toolName: "read_file" });
+  emit({ type: "text", data: "{ this is not valid json at all" });
+  emit({ type: "end", stopReason: "end_turn", sessionId, requestId: "req-fake", structuredOutput: REVIEW_OBJECT });
+  state.sessions.push(sessionId);
+  saveState(state);
+  process.exit(0);
+}
+
+if (BEHAVIOR === "review-truncated") {
+  const serialized = JSON.stringify(REVIEW_OBJECT);
+  emit({ type: "text", data: serialized.slice(0, serialized.indexOf("Guard against") + 8) });
+  emit({ type: "end", stopReason: "max_tokens", sessionId, requestId: "req-fake" });
+  state.sessions.push(sessionId);
+  saveState(state);
+  process.exit(0);
+}
+
+if (BEHAVIOR === "review-truncated-allclear") {
+  // Cut off before a single finding was written. Repair can only close the
+  // empty array, which would read as a clean approval the model never gave.
+  if (parsed.flags.resume) {
+    emit({ type: "text", data: JSON.stringify(REVIEW_OBJECT) });
+    emit({ type: "end", stopReason: "end_turn", sessionId, requestId: "req-fake" });
+  } else {
+    emit({ type: "text", data: '{"verdict":"approve","summary":"No issues","findings":[' });
+    emit({ type: "end", stopReason: "end_turn", sessionId, requestId: "req-fake" });
+  }
+  state.sessions.push(sessionId);
+  saveState(state);
+  process.exit(0);
+}
+
+if (BEHAVIOR === "killed-mid-run") {
+  // A process that dies from a signal reports a null exit code, which must not
+  // read as success — /grok:cancel kills the tree exactly this way.
+  emit({ type: "text", data: '{"verdict":"approve","summary":"partial' });
+  process.kill(process.pid, "SIGTERM");
+  setTimeout(() => process.exit(0), 1000);
+  return;
+}
+
+if (BEHAVIOR === "review-reemit") {
+  // First run emits nothing parseable at all; the resumed run emits the object.
+  if (parsed.flags.resume) {
+    emit({ type: "text", data: JSON.stringify(REVIEW_OBJECT) });
+    emit({ type: "end", stopReason: "end_turn", sessionId, requestId: "req-fake" });
+  } else {
+    emit({ type: "text", data: "I could not finish formatting the answer." });
+    emit({ type: "end", stopReason: "end_turn", sessionId, requestId: "req-fake" });
+  }
+  state.sessions.push(sessionId);
+  saveState(state);
+  process.exit(0);
+}
+
+if (BEHAVIOR === "stop-gate-narrated") {
+  // The verdict is not the first thing said — narration comes first.
+  emit({ type: "text", data: "Let me check what the previous turn changed." });
+  emit({ type: "tool_call", toolCallId: "c1", title: "Shell", kind: "execute", status: "in_progress", toolName: "run_terminal_cmd", rawInput: { command: "git diff" } });
+  emit({ type: "tool_call_update", toolCallId: "c1", status: "completed", toolName: "run_terminal_cmd" });
+  emit({ type: "text", data: "ALLOW: the previous turn only reported status" });
+  emit({ type: "end", stopReason: "end_turn", sessionId, requestId: "req-fake" });
+  state.sessions.push(sessionId);
+  saveState(state);
+  process.exit(0);
+}
+
 emit({ type: "thought", data: "Inspecting the repository state." });
 emit({
   type: "tool_call",

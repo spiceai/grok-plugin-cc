@@ -132,6 +132,120 @@ test("adversarial review returns structured findings when schema is used", () =>
   assert.ok(payload.result || payload.rawOutput);
 });
 
+/**
+ * The failure that made `/grok:adversarial-review` unusable end to end: Grok
+ * narrates between tool calls, and under a JSON schema that narration is itself
+ * JSON. Concatenating every `text` event produced back-to-back objects, so a
+ * review that had actually succeeded was reported as malformed output.
+ */
+test("adversarial review recovers the final object from interim JSON drafts", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-drafts");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+
+  assert.equal(payload.parseError, null, "drafted output must not surface as a parse failure");
+  assert.equal(payload.result.summary, "Found one material issue in the change set.");
+  assert.equal(payload.result.findings.length, 1);
+});
+
+test("adversarial review trusts grok's own structured output over the text stream", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-structured");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+
+  assert.equal(payload.parseError, null);
+  assert.equal(payload.result.verdict, "needs-attention");
+});
+
+test("adversarial review salvages findings from output cut off by the token budget", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-truncated");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+
+  assert.equal(payload.parseError, null);
+  assert.equal(payload.recovered, "truncated-json");
+  assert.equal(payload.stopReason, "max_tokens");
+  assert.equal(payload.result.verdict, "needs-attention");
+});
+
+/**
+ * Repairing a half-written answer can only close the containers it was given.
+ * When the cut lands before any finding, that produces a clean approval with an
+ * empty findings list — an all-clear the model never gave, and the worst
+ * possible thing for a review tool to report. It must never be the answer.
+ */
+test("adversarial review refuses a salvaged all-clear and restates the review instead", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-truncated-allclear");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+
+  assert.notEqual(payload.result?.verdict, "approve", "a repaired empty approval must not be reported as the verdict");
+  assert.equal(payload.result.findings.length, 1, "the restated review should have replaced the salvage");
+  assert.equal(payload.parseError, null);
+});
+
+/**
+ * Node reports a null exit code when a child dies from a signal, which is
+ * exactly how /grok:cancel stops a run. Treating that as success would store the
+ * partial output as a completed review.
+ */
+test("a grok process killed by a signal is reported as a failure, not a completed run", async () => {
+  const { runGrokTurn } = await import("../plugins/grok/scripts/lib/grok.mjs");
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "killed-mid-run");
+  const env = buildEnv(binDir);
+  const cwd = prepareRepo();
+
+  const result = await runGrokTurn(cwd, { prompt: "review this", env });
+
+  assert.equal(result.status, 1, "a signalled run must not report success");
+  assert.equal(result.exitCode, null, "signalled processes report a null exit code");
+  assert.ok(result.exitSignal, "the signal should be retained");
+  assert.match(result.error.message, /signal/i);
+});
+
+test("adversarial review asks grok to re-emit when nothing parses", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-reemit");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+
+  assert.equal(payload.parseError, null, "the resumed re-emit run should have produced a usable object");
+  assert.equal(payload.result.findings.length, 1);
+
+  const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-grok-state.json"), "utf8"));
+  assert.ok(state.lastArgs.includes("--resume"), "the retry must resume the same grok session");
+});
+
 test("task run returns final message and session id", () => {
   const binDir = makeTempDir();
   installFakeGrok(binDir, "task-ok");
@@ -383,6 +497,30 @@ test("stop review gate blocks on BLOCK response when enabled", () => {
   const decision = JSON.parse(result.stdout);
   assert.equal(decision.decision, "block");
   assert.match(decision.reason, /BLOCK|debug|issues/i);
+});
+
+/**
+ * Grok narrates before it answers, so the verdict is rarely the first line of a
+ * run's captured output. Anchoring the gate on line one turned "let me check
+ * the diff" into an unexpected answer and blocked the session on every pass.
+ */
+test("stop review gate reads the verdict grok settled on, not its opening narration", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "stop-gate-narrated");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+
+  run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], { cwd, env });
+
+  const result = run("node", [STOP_HOOK], {
+    cwd,
+    env,
+    input: JSON.stringify({ cwd, last_assistant_message: "Here is the status you asked for." })
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), "", "a narrated ALLOW must not block the session");
 });
 
 /**

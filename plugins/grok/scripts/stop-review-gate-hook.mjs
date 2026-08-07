@@ -76,12 +76,20 @@ function parseStopReviewOutput(rawOutput) {
     };
   }
 
-  const firstLine = text.split(/\r?\n/, 1)[0].trim();
-  if (firstLine.startsWith("ALLOW:")) {
+  // Grok narrates while it works, so the verdict is not reliably the first line
+  // of the captured output. Take the last verdict line it wrote — that is the
+  // one it settled on, and anchoring on line one turned narration into a block.
+  const verdict = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("ALLOW:") || line.startsWith("BLOCK:"))
+    .pop();
+
+  if (verdict?.startsWith("ALLOW:")) {
     return { ok: true, reason: null };
   }
-  if (firstLine.startsWith("BLOCK:")) {
-    const reason = firstLine.slice("BLOCK:".length).trim() || text;
+  if (verdict?.startsWith("BLOCK:")) {
+    const reason = verdict.slice("BLOCK:".length).trim() || text;
     return {
       ok: false,
       reason: `Grok stop-time review found issues that still need fixes before ending the session: ${reason}`
