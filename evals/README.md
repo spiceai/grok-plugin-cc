@@ -178,6 +178,25 @@ three contract mismatches, and one of them is not fixable from the plugin:
 | `-m grok-build` | Not a model id — `grok models` lists `grok-4.5`. Unknown ids are a hard error, not a fallback. |
 | `--disallowed-tools search_replace,write,…` | Correct tool names, but **not sufficient**. `run_terminal_command` is not in the list, and `printf > file` writes just fine. |
 
+Re-probed against **grok 1.0.3** (2026-08-12), since a major version jump is the
+first thing to suspect when the plugin "starts failing again". It was not the
+cause that time — the contract holds:
+
+- `--no-auto-update`, `--verbatim`, `--always-approve`, `--effort`,
+  `--json-schema` and `--disallowed-tools` all still parse. `grok <flag> --help`
+  is a free arg-parse probe; use it before assuming drift.
+- `--json-schema` help now says "Implies `--output-format json`", but an
+  explicit `--output-format streaming-json` still wins and NDJSON events are
+  still emitted. Adversarial review is the only `--json-schema` caller and is
+  unaffected.
+- Real `end` events carry **no `result` field** — the final message has to come
+  from accumulated `text` deltas (or `structuredOutput`). Note that the fake CLI
+  in `tests/fake-grok-fixture.mjs` *does* emit `end.result`, so the fixture is
+  more forgiving than the real binary.
+- `grok models` now lists `grok-4.6` (default) and `grok-4.5`. The `build` and
+  `fast` aliases still resolve to `grok-4.5`, so asking for `build` now gets the
+  older of the two. Valid, but worth a deliberate decision rather than drift.
+
 **Read-only is not enforceable from the plugin today.** Probed directly against
 the live CLI: `--sandbox read-only` did not stop the `write` tool, and
 `--permission-mode plan` did not either — both let a write through to the

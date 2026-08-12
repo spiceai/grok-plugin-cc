@@ -9,8 +9,90 @@ const STATE_VERSION = 1;
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
 const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "grok-companion");
 const STATE_FILE_NAME = "state.json";
+const LOCK_FILE_NAME = "state.json.lock";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
+const LOCK_TIMEOUT_MS = 5000;
+// The critical section is a small read and write — single-digit milliseconds.
+// A lock file older than this belongs to a process that died holding it.
+const LOCK_STALE_MS = 5000;
+const LOCK_RETRY_MS = 10;
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Background runs are separate processes sharing one index file, so every
+ * read-modify-write has to be exclusive. Without this, two jobs starting at the
+ * same moment each read an index that lacks the other and the second write
+ * wins, dropping a job that is running perfectly well — or reducing it to an
+ * id-only stub when its next progress patch lands on state it is missing from.
+ *
+ * Best effort by design: a lock that cannot be taken is abandoned rather than
+ * throwing, because losing an index entry is a far smaller failure than
+ * refusing to run a review.
+ */
+function withStateLock(cwd, fn) {
+  const stateDir = resolveStateDir(cwd);
+  fs.mkdirSync(stateDir, { recursive: true });
+  const lockPath = path.join(stateDir, LOCK_FILE_NAME);
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  let held = false;
+
+  while (!held && Date.now() <= deadline) {
+    try {
+      fs.writeFileSync(lockPath, String(process.pid), { flag: "wx" });
+      held = true;
+      break;
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        break;
+      }
+      // A process killed mid-write leaves its lock behind forever otherwise.
+      try {
+        if (Date.now() - fs.statSync(lockPath).mtimeMs > LOCK_STALE_MS) {
+          fs.unlinkSync(lockPath);
+          continue;
+        }
+      } catch {
+        // The holder released it between our open and our stat; just retry.
+      }
+      sleepSync(LOCK_RETRY_MS);
+    }
+  }
+
+  try {
+    return fn();
+  } finally {
+    if (held) {
+      try {
+        fs.unlinkSync(lockPath);
+      } catch {
+        // Already released.
+      }
+    }
+  }
+}
+
+/**
+ * Rename is atomic, so a concurrent reader sees either the old index or the new
+ * one and never a half-written file it would parse as empty and then overwrite.
+ */
+function writeFileAtomic(filePath, contents) {
+  const tempPath = `${filePath}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.tmp`;
+  fs.writeFileSync(tempPath, contents, "utf8");
+  try {
+    fs.renameSync(tempPath, filePath);
+  } catch (error) {
+    try {
+      fs.unlinkSync(tempPath);
+    } catch {
+      // Nothing to clean up.
+    }
+    throw error;
+  }
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -77,10 +159,51 @@ export function loadState(cwd) {
   }
 }
 
+const ACTIVE_JOB_STATUSES = new Set(["queued", "running"]);
+
+function isActiveJob(job) {
+  return ACTIVE_JOB_STATUSES.has(job?.status);
+}
+
+function byUpdatedAtDesc(left, right) {
+  return String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? ""));
+}
+
+/**
+ * Every background run is its own process writing to one shared index, so the
+ * snapshot a caller mutated is routinely stale by the time it saves. Union the
+ * caller's jobs over whatever is on disk now — a job this caller has never
+ * heard of belongs to a concurrent run and must survive, otherwise the two
+ * background jobs delete each other.
+ */
+function mergeJobs(diskJobs, callerJobs) {
+  const merged = new Map();
+  for (const job of diskJobs) {
+    if (job?.id) {
+      merged.set(job.id, job);
+    }
+  }
+  for (const job of callerJobs) {
+    if (!job?.id) {
+      continue;
+    }
+    const existing = merged.get(job.id);
+    merged.set(job.id, existing ? { ...existing, ...job } : job);
+  }
+  return [...merged.values()];
+}
+
+/**
+ * Active jobs are never evicted by the cap. Their worker is still appending to
+ * the log and job file, so dropping one both orphans a run that is in flight
+ * and deletes the artifacts it is still writing.
+ */
 function pruneJobs(jobs) {
-  return [...jobs]
-    .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")))
-    .slice(0, MAX_JOBS);
+  const sorted = [...jobs].sort(byUpdatedAtDesc);
+  const active = sorted.filter(isActiveJob);
+  const inactive = sorted.filter((job) => !isActiveJob(job));
+  const inactiveBudget = Math.max(0, MAX_JOBS - active.length);
+  return [...active, ...inactive.slice(0, inactiveBudget)].sort(byUpdatedAtDesc);
 }
 
 function removeFileIfExists(filePath) {
@@ -89,10 +212,10 @@ function removeFileIfExists(filePath) {
   }
 }
 
-export function saveState(cwd, state) {
+function saveStateLocked(cwd, state) {
   const previousJobs = loadState(cwd).jobs;
   ensureStateDir(cwd);
-  const nextJobs = pruneJobs(state.jobs ?? []);
+  const nextJobs = pruneJobs(mergeJobs(previousJobs, state.jobs ?? []));
   const nextState = {
     version: STATE_VERSION,
     config: {
@@ -111,14 +234,25 @@ export function saveState(cwd, state) {
     removeFileIfExists(job.logFile);
   }
 
-  fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  writeFileAtomic(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`);
   return nextState;
 }
 
+export function saveState(cwd, state) {
+  return withStateLock(cwd, () => saveStateLocked(cwd, state));
+}
+
+/**
+ * Load, mutate and save as one critical section. Splitting them would reopen
+ * the window this lock exists to close: a patch computed against state read
+ * before another process wrote would silently revert that process's fields.
+ */
 export function updateState(cwd, mutate) {
-  const state = loadState(cwd);
-  mutate(state);
-  return saveState(cwd, state);
+  return withStateLock(cwd, () => {
+    const state = loadState(cwd);
+    mutate(state);
+    return saveStateLocked(cwd, state);
+  });
 }
 
 export function generateJobId(prefix = "job") {
@@ -166,7 +300,8 @@ export function getConfig(cwd) {
 export function writeJobFile(cwd, jobId, payload) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
-  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  // Atomic so `/grok:status` polling a running job never reads a partial record.
+  writeFileAtomic(jobFile, `${JSON.stringify(payload, null, 2)}\n`);
   return jobFile;
 }
 
