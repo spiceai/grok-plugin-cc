@@ -259,6 +259,35 @@ if (BEHAVIOR === "killed-mid-run") {
   return;
 }
 
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// A review that fails outright. The generic "fail" behavior is unreachable for
+// reviews, because a review-shaped prompt is answered before the failure branch
+// is ever reached — so without this the background failure path is untestable.
+if (BEHAVIOR === "review-fail") {
+  emit({ type: "thought", data: "Collecting the diff." });
+  emit({ type: "error", message: "Simulated Grok review failure." });
+  process.exit(1);
+}
+
+// Stays in flight until killed, announcing itself first so a test can wait for
+// the job to genuinely be running instead of racing it.
+if (BEHAVIOR === "hang") {
+  emit({ type: "thought", data: "Starting a long review." });
+  if (process.env.FAKE_GROK_STARTED_FILE) {
+    fs.writeFileSync(process.env.FAKE_GROK_STARTED_FILE, String(process.pid), "utf8");
+  }
+  sleepSync(Number(process.env.FAKE_GROK_HANG_MS || 600000));
+  process.exit(0);
+}
+
+if (BEHAVIOR === "slow-review") {
+  emit({ type: "thought", data: "Working through the diff." });
+  sleepSync(Number(process.env.FAKE_GROK_SLEEP_MS || 1200));
+}
+
 if (BEHAVIOR === "review-reemit") {
   // First run emits nothing parseable at all; the resumed run emits the object.
   if (parsed.flags.resume) {

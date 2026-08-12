@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.0.2
+
+Background-mode fixes. Every background run is a separate process sharing one
+job index, and none of the following was reachable from a foreground run, so the
+test suite stayed green while the plugin misbehaved in real use.
+
+- Concurrent background jobs no longer delete each other. Job state is now
+  read-modify-written under an exclusive lock and published by atomic rename;
+  previously a second job starting while the first was saving could drop the
+  first from the index, reduce it to an id-only stub, and delete its job file
+  and log.
+- The job cap no longer evicts a job that is still running. A long background
+  review could be pruned mid-flight, deleting the log it was still writing to.
+- A background job whose process was killed is now reconciled to `failed`
+  instead of reporting `running` forever. Previously that stuck record made
+  `/grok:status` never settle, blocked every later `--resume-last`, forced an
+  explicit job id on `/grok:cancel`, and let cancel signal a pid the OS may
+  since have reassigned to an unrelated process.
+
 ## 1.0.1
 
 - Fix reviews failing with "Grok did not return valid structured JSON". Grok narrates

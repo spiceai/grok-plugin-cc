@@ -12,6 +12,65 @@ export function sortJobsNewestFirst(jobs) {
   return [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
 }
 
+const ACTIVE_JOB_STATUSES = new Set(["queued", "running"]);
+
+export const ORPHANED_JOB_MESSAGE =
+  "Job process exited without recording a result. It was most likely killed or the terminal it ran in went away.";
+
+function isProcessAlive(pid, options = {}) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  const killImpl = options.killImpl ?? process.kill.bind(process);
+  try {
+    killImpl(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM means the pid exists but belongs to another user, so it is alive.
+    return error?.code === "EPERM";
+  }
+}
+
+/**
+ * A background job only leaves `running` because its own process wrote the
+ * completion record. Kill that process — `/kill`, a closed terminal, an OOM —
+ * and the record stays `running` forever: `/grok:status` reports a run that
+ * ended hours ago, `--resume-last` refuses to continue behind it, and
+ * `/grok:cancel` would signal a pid the OS may since have handed to something
+ * else. Reconciling at read time keeps that bookkeeping honest without another
+ * writer racing for the state file.
+ */
+export function isOrphanedJob(job, options = {}) {
+  return (
+    ACTIVE_JOB_STATUSES.has(job?.status) &&
+    job?.pid != null &&
+    !isProcessAlive(Number(job.pid), options)
+  );
+}
+
+export function reconcileJob(job, options = {}) {
+  if (!isOrphanedJob(job, options)) {
+    return job;
+  }
+  return {
+    ...job,
+    status: "failed",
+    phase: "orphaned",
+    pid: null,
+    orphaned: true,
+    errorMessage: job.errorMessage ?? ORPHANED_JOB_MESSAGE,
+    completedAt: job.completedAt ?? job.updatedAt ?? null
+  };
+}
+
+export function reconcileJobs(jobs, options = {}) {
+  return jobs.map((job) => reconcileJob(job, options));
+}
+
+export function listReconciledJobs(workspaceRoot, options = {}) {
+  return reconcileJobs(listJobs(workspaceRoot), options);
+}
+
 function getCurrentSessionId(options = {}) {
   return options.env?.[SESSION_ID_ENV] ?? process.env[SESSION_ID_ENV] ?? null;
 }
@@ -213,7 +272,7 @@ function matchJobReference(jobs, reference, predicate = () => true) {
 export function buildStatusSnapshot(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
-  const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), options));
+  const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listReconciledJobs(workspaceRoot, options), options));
   const maxJobs = options.maxJobs ?? DEFAULT_MAX_STATUS_JOBS;
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
 
@@ -241,7 +300,7 @@ export function buildStatusSnapshot(cwd, options = {}) {
 
 export function buildSingleJobSnapshot(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+  const jobs = sortJobsNewestFirst(listReconciledJobs(workspaceRoot, options));
   const selected = matchJobReference(jobs, reference);
   if (!selected) {
     throw new Error(`No job found for "${reference}". Run /grok:status to inspect known jobs.`);
@@ -253,9 +312,10 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
   };
 }
 
-export function resolveResultJob(cwd, reference) {
+export function resolveResultJob(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(reference ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot)));
+  const reconciled = listReconciledJobs(workspaceRoot, options);
+  const jobs = sortJobsNewestFirst(reference ? reconciled : filterJobsForCurrentSession(reconciled, options));
   const selected = matchJobReference(
     jobs,
     reference,
@@ -280,7 +340,9 @@ export function resolveResultJob(cwd, reference) {
 
 export function resolveCancelableJob(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+  // Reconciled first: cancelling an orphaned job would send SIGTERM to a pid
+  // the OS is free to have reassigned to an unrelated process.
+  const jobs = sortJobsNewestFirst(listReconciledJobs(workspaceRoot, options));
   const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
 
   if (reference) {
