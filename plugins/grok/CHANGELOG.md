@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.0.3
+
+Review-integrity fixes. Both defects made a broken review run look like a
+finished one, which is the worst way for a review tool to fail.
+
+- A review that asserts nothing is now reported as failed instead of as "no
+  findings". Grok can end a turn with an object that satisfies the schema and
+  says nothing — a literal `PLACEHOLDER` summary, or the narration it was
+  writing while still investigating — and that rendered as
+  `Verdict: needs-attention / No material findings`, indistinguishable from a
+  clean bill of health. Such a run is now retried once with an instruction to
+  restate the real assessment, and if it still cannot, the job is recorded
+  `failed` with the raw output shown. A non-approving verdict carrying no
+  findings is rejected on the same grounds.
+- Branch reviews no longer diff from a stale local base branch.
+  `refs/remotes/origin/HEAD` was read for the default branch *name* and then
+  resolved to the local branch of that name, which on a feature branch is
+  usually months behind `origin/`. Once the branch merged the real base in,
+  every upstream commit since then landed inside the review: one 8-file change
+  was reviewed as 113 files of unrelated trunk work. The base is now whichever
+  of `origin/<name>` and `<name>` forks from HEAD most recently, so a stale copy
+  on either side cannot widen the scope. An explicit `--base` is still used
+  verbatim.
+- Review prompts now name the exact commit range and the in-scope file list
+  instead of naming the base branch and leaving the command to the model.
+  `git diff <base>`, `git show HEAD`, and the diff of a merge commit all sweep
+  in merged-in upstream work, and a model given only a branch name reaches for
+  them. This applies to both `/grok:review` and `/grok:adversarial-review`.
+
 ## 1.0.2
 
 Background-mode fixes. Every background run is a separate process sharing one

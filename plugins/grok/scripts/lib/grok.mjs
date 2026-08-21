@@ -621,14 +621,34 @@ export async function runAppServerTurn(cwd, options = {}) {
 }
 
 /** Native-style review: headless review prompt over git changes. */
+// Enough of the file list to pin scope without swamping the prompt.
+const MAX_SCOPE_FILES_IN_PROMPT = 40;
+
+function formatScopeFiles(files) {
+  const listed = files.slice(0, MAX_SCOPE_FILES_IN_PROMPT).join(", ");
+  const remaining = files.length - MAX_SCOPE_FILES_IN_PROMPT;
+  return remaining > 0 ? `${listed}, and ${remaining} more` : listed;
+}
+
 export async function runAppServerReview(cwd, options = {}) {
   const target = options.target;
   let reviewPrompt;
   if (target?.type === "baseBranch") {
+    // Naming only the base branch leaves the range to the model, and `git diff
+    // <base>` or the diff of a merge commit sweeps in upstream work the branch
+    // merely merged in. The caller already resolved the range; state it.
+    const range = target.commitRange ?? `${target.branch}...HEAD`;
     reviewPrompt = [
       "Perform a thorough code review of the changes on this branch compared to the base branch.",
       `Base branch: ${target.branch}`,
-      "Use git to inspect the diff against the base branch.",
+      `Review exactly this range: \`git diff ${range}\`. Run that range verbatim.`,
+      `Do not use \`git diff ${target.branch}\`, \`git show HEAD\`, or the diff of a merge commit: this branch may have merged the base branch in, and those include unrelated upstream changes.`,
+      ...(target.changedFiles?.length
+        ? [
+            `Only these ${target.changedFiles.length} file(s) are in scope: ${formatScopeFiles(target.changedFiles)}.`,
+            "Do not report findings against any file outside that list."
+          ]
+        : []),
       "Report concrete findings with severity, file paths, and line ranges when possible.",
       "Do not modify any files."
     ].join("\n");
@@ -636,6 +656,7 @@ export async function runAppServerReview(cwd, options = {}) {
     reviewPrompt = [
       "Perform a thorough code review of the current uncommitted working tree changes.",
       "Use git status and git diff (staged and unstaged) to inspect the changes.",
+      "Review only uncommitted work. Do not review committed history.",
       "Report concrete findings with severity, file paths, and line ranges when possible.",
       "Do not modify any files."
     ].join("\n");

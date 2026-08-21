@@ -62,7 +62,7 @@ test("default branch names with special characters are passed to git literally",
   const context = collectReviewContext(cwd, target);
 
   assert.equal(target.mode, "branch");
-  assert.equal(target.baseRef, branchName);
+  assert.equal(target.baseRef, `origin/${branchName}`);
   assert.match(context.content, /Branch Diff/);
   assert.equal(fs.existsSync(helperOutputPath), false);
 });
@@ -209,4 +209,118 @@ test("collectReviewContext keeps untracked file content in lightweight working t
   assert.doesNotMatch(context.content, /TRACKED_MARKER_[AB]/);
   assert.match(context.content, /## Untracked Files/);
   assert.match(context.content, /UNTRACKED_RISK_MARKER/);
+});
+
+/**
+ * The wrong-scope failure, reproduced.
+ *
+ * `refs/remotes/origin/HEAD` names the default branch, but on a feature branch
+ * nobody ever checks that branch out, so the local copy goes stale while
+ * `origin/<name>` tracks reality. Once the branch merges the real base in,
+ * diffing from the stale local copy replays every upstream commit as part of
+ * the change — which is how an 8-file review became 113 files of unrelated
+ * trunk work: cloud CLI, object store, and CI churn the branch never touched.
+ */
+test("branch review skips upstream work the branch merely merged in", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "base.js"), "export const base = 1;\n");
+  run("git", ["add", "base.js"], { cwd });
+  run("git", ["commit", "-m", "base"], { cwd });
+  const baseCommit = run("git", ["rev-parse", "HEAD"], { cwd }).stdout.trim();
+
+  // The local `main` never moves again; `origin/main` is what advances.
+  run("git", ["update-ref", "refs/remotes/origin/main", baseCommit], { cwd });
+  run("git", ["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"], { cwd });
+
+  // Upstream lands work this branch has nothing to do with.
+  run("git", ["checkout", "-b", "upstream-sim"], { cwd });
+  fs.writeFileSync(path.join(cwd, "object-store.js"), "export const store = 'upstream';\n");
+  run("git", ["add", "object-store.js"], { cwd });
+  run("git", ["commit", "-m", "upstream: object store"], { cwd });
+  const upstreamCommit = run("git", ["rev-parse", "HEAD"], { cwd }).stdout.trim();
+  run("git", ["update-ref", "refs/remotes/origin/main", upstreamCommit], { cwd });
+  run("git", ["checkout", "main"], { cwd });
+  run("git", ["branch", "-D", "upstream-sim"], { cwd });
+
+  // The branch does its own work, then merges the current base in.
+  run("git", ["checkout", "-b", "feature/scoped"], { cwd });
+  fs.writeFileSync(path.join(cwd, "feature.js"), "export const feature = 1;\n");
+  run("git", ["add", "feature.js"], { cwd });
+  run("git", ["commit", "-m", "feature work"], { cwd });
+  run("git", ["merge", "--no-edit", "origin/main"], { cwd });
+
+  const target = resolveReviewTarget(cwd, {});
+  const context = collectReviewContext(cwd, target);
+
+  assert.equal(target.baseRef, "origin/main", "the stale local branch must not be the review base");
+  assert.deepEqual(context.changedFiles, ["feature.js"]);
+  assert.ok(
+    !context.changedFiles.includes("object-store.js"),
+    "upstream work merged into the branch is not part of the change under review"
+  );
+});
+
+test("an explicit base is honored even when a fresher ref exists", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "base.js"), "export const base = 1;\n");
+  run("git", ["add", "base.js"], { cwd });
+  run("git", ["commit", "-m", "base"], { cwd });
+  run("git", ["update-ref", "refs/remotes/origin/main", "HEAD"], { cwd });
+  run("git", ["checkout", "-b", "feature/explicit"], { cwd });
+  fs.writeFileSync(path.join(cwd, "feature.js"), "export const feature = 1;\n");
+  run("git", ["add", "feature.js"], { cwd });
+  run("git", ["commit", "-m", "feature"], { cwd });
+
+  const target = resolveReviewTarget(cwd, { base: "main" });
+
+  assert.equal(target.baseRef, "main", "an explicit --base must be used verbatim");
+});
+
+/**
+ * Naming the base branch and leaving the command to the model is what let the
+ * reviewer reach for `git diff <base>` or the diff of a merge commit. The range
+ * is known here, so the prompt has to state it.
+ */
+test("collection guidance pins the exact review range and file list", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  for (const name of ["a.js", "b.js", "c.js"]) {
+    fs.writeFileSync(path.join(cwd, name), `export const value = "${name}-v1";\n`);
+  }
+  run("git", ["add", "."], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  run("git", ["checkout", "-b", "feature/guidance"], { cwd });
+  for (const name of ["a.js", "b.js", "c.js"]) {
+    fs.writeFileSync(path.join(cwd, name), `export const value = "${name}-v2";\n`);
+  }
+  run("git", ["add", "."], { cwd });
+  run("git", ["commit", "-m", "change"], { cwd });
+
+  const target = resolveReviewTarget(cwd, {});
+  const context = collectReviewContext(cwd, target);
+  const mergeBase = run("git", ["merge-base", "HEAD", target.baseRef], { cwd }).stdout.trim();
+
+  assert.equal(context.inputMode, "self-collect");
+  assert.match(context.collectionGuidance, new RegExp(`git diff ${mergeBase}\\.\\.HEAD`));
+  assert.match(context.collectionGuidance, /In scope \(3 file\(s\)\): a\.js, b\.js, c\.js/);
+  assert.match(context.collectionGuidance, /outside that list is out of scope/i);
+  assert.match(context.collectionGuidance, /git show HEAD/, "the wrong commands must be named explicitly");
+});
+
+test("working tree guidance pins scope to uncommitted work", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "export const value = 1;\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.writeFileSync(path.join(cwd, "app.js"), "export const value = 2;\n");
+
+  const target = resolveReviewTarget(cwd, {});
+  const context = collectReviewContext(cwd, target);
+
+  assert.equal(target.mode, "working-tree");
+  assert.match(context.collectionGuidance, /uncommitted working tree/i);
+  assert.match(context.collectionGuidance, /In scope \(1 file\(s\)\): app\.js/);
 });

@@ -209,6 +209,79 @@ test("adversarial review refuses a salvaged all-clear and restates the review in
 });
 
 /**
+ * The failure this guards against was observed three runs running: Grok ended
+ * its turn with `{"verdict":"needs-attention","summary":"PLACEHOLDER",
+ * "findings":[]}`. It parses, it validates against the schema, and it renders
+ * as "No material findings" — a broken run presented as a clean bill of health.
+ * A review that asserts nothing has to be reported as failed.
+ */
+test("a placeholder summary is reported as a failed review, not as no findings", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-placeholder");
+  const env = buildEnv(binDir);
+  const pluginData = makeTempDir("plugin-data-");
+  env.CLAUDE_PLUGIN_DATA = pluginData;
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  const payload = JSON.parse(result.stdout);
+
+  assert.notEqual(result.status, 0, "a review that asserted nothing must not exit clean");
+  assert.equal(payload.result, null, "the stub must not be handed back as the review");
+  assert.match(payload.parseError, /placeholder/i);
+
+  const rendered = run("node", [SCRIPT, "adversarial-review"], { cwd, env });
+  assert.doesNotMatch(rendered.stdout, /No material findings/, "a failed run must not read as a clean review");
+
+  // The user reads /grok:status, not the exit code. The job has to say failed.
+  const stateRoot = path.join(pluginData, "state");
+  const stateDir = path.join(stateRoot, fs.readdirSync(stateRoot)[0]);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const reviewJobs = state.jobs.filter((job) => job.jobClass === "review");
+  assert.ok(reviewJobs.length > 0, "the review should have been tracked");
+  assert.ok(
+    reviewJobs.every((job) => job.status === "failed"),
+    `a review that asserted nothing must be recorded as failed, got ${reviewJobs.map((job) => job.status).join(", ")}`
+  );
+});
+
+/**
+ * Same failure, different shape: the model describing the review it is still
+ * doing. Zero findings behind a non-approving verdict is never an all-clear.
+ */
+test("an unfinished narrated review is reported as a failure", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-narrated");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  const payload = JSON.parse(result.stdout);
+
+  assert.notEqual(result.status, 0);
+  assert.equal(payload.result, null);
+  assert.ok(payload.parseError, "the run must carry a reason it failed");
+});
+
+/** The session is still warm, so a stub is worth one restate turn first. */
+test("a placeholder review is restated rather than lost when grok can still answer", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-placeholder-restated");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+
+  assert.equal(payload.parseError, null);
+  assert.notEqual(payload.result.summary, "PLACEHOLDER");
+  assert.ok(payload.result.findings.length > 0);
+});
+
+/**
  * Node reports a null exit code when a child dies from a signal, which is
  * exactly how /grok:cancel stops a run. Treating that as success would store the
  * partial output as a completed review.
@@ -561,4 +634,39 @@ test("buildGrokHeadlessArgs includes resume and disallows writes for read-only",
   assert.ok(args.includes("--disallowed-tools"));
   assert.ok(args.includes("-m"));
   assert.ok(args.includes("grok-4.5"));
+});
+
+/**
+ * The native reviewer builds its own prompt, so the range has to be pinned
+ * there too. Handing it only a base branch name is what let it reach for
+ * `git diff <base>` and review upstream work the branch merely merged in.
+ */
+test("native branch review pins the commit range and file list in its prompt", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-ok");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+
+  const cwd = makeTempDir("grok-repo-");
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "base.js"), "export const base = 1;\n");
+  run("git", ["add", "base.js"], { cwd });
+  run("git", ["commit", "-m", "base"], { cwd });
+  run("git", ["update-ref", "refs/remotes/origin/main", "HEAD"], { cwd });
+  run("git", ["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"], { cwd });
+  run("git", ["checkout", "-b", "feature/native"], { cwd });
+  fs.writeFileSync(path.join(cwd, "feature.js"), "export const feature = 1;\n");
+  run("git", ["add", "feature.js"], { cwd });
+  run("git", ["commit", "-m", "feature"], { cwd });
+
+  const result = run("node", [SCRIPT, "review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+
+  const mergeBase = run("git", ["merge-base", "HEAD", "origin/main"], { cwd }).stdout.trim();
+  const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-grok-state.json"), "utf8"));
+  const prompt = state.lastArgs[state.lastArgs.indexOf("-p") + 1];
+
+  assert.match(prompt, new RegExp(`git diff ${mergeBase}\\.\\.HEAD`), "the exact range must be named");
+  assert.match(prompt, /Only these 1 file\(s\) are in scope: feature\.js/);
+  assert.doesNotMatch(prompt, /Use git to inspect the diff against the base branch\./);
 });

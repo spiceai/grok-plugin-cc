@@ -23,7 +23,7 @@ import {
   } from "./lib/grok.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
-import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
+import { collectReviewContext, ensureGitRepository, getBranchReviewRange, resolveReviewTarget } from "./lib/git.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
@@ -266,6 +266,16 @@ const REVIEW_REEMIT_PROMPT = [
   "Do not run any more tools — use the findings you already have."
 ].join("\n");
 
+// Re-emitting is the wrong ask when the previous object parsed perfectly and
+// simply said nothing; repeating "emit valid JSON" invites the same stub back.
+const REVIEW_RESTATE_PROMPT = [
+  "Your previous answer was valid JSON but was not a review: it was a placeholder or a description of work still in progress.",
+  "Emit the finished review now as exactly one JSON object matching the schema.",
+  "The summary must be your actual assessment of the change, not a placeholder token and not a description of what you are about to do.",
+  "Every concern you have must appear as a finding. Use verdict `needs-attention` only when you list at least one finding; if the change is genuinely clean, use `approve` and say why in the summary.",
+  "Output only that object: no prose, no code fences, no progress updates, and no second copy."
+].join("\n");
+
 /** A parsed object is only useful as a review if it carries the review fields. */
 function looksLikeReviewResult(value) {
   return (
@@ -295,6 +305,48 @@ function isFabricatedAllClear(parsed) {
   );
 }
 
+// A summary that is a filler token rather than an assessment.
+const PLACEHOLDER_SUMMARY =
+  /^\W*(placeholder|tbd|to ?be ?(determined|filled|written)|todo|fixme|n\/?a|none|null|nil|pending|unknown|summary(?: here| goes here)?|xxx+|lorem ipsum|[.\-_*]+)\W*$/i;
+
+// Present-tense narration: the model describing the review it has not finished.
+const IN_PROGRESS_SUMMARY =
+  /\b(investigating|analy[sz]ing|reviewing now|still (?:reviewing|investigating|checking)|will (?:now )?(?:review|inspect|check|examine|verify)|about to (?:review|inspect|check)|let me\b|i(?:'ll| will) (?:now )?(?:review|inspect|check|start)|review in progress|in progress)\b/i;
+
+/**
+ * Decide whether a schema-valid object is actually a review.
+ *
+ * Grok can end a turn with something that satisfies the schema but asserts
+ * nothing: a literal `"PLACEHOLDER"` summary, or the narration it was writing
+ * while it was still investigating. Both render as
+ * `Verdict: needs-attention / No material findings`, which reads exactly like a
+ * clean bill of health — the most dangerous way for a review tool to fail. A
+ * broken run has to surface as broken, not as "nothing found".
+ *
+ * @returns {string | null} why the object is unusable, or null when it is a review
+ */
+function findUnusableReviewReason(review) {
+  const summary = String(review?.summary ?? "").trim();
+  const verdict = String(review?.verdict ?? "").trim().toLowerCase();
+  const findings = Array.isArray(review?.findings) ? review.findings : [];
+
+  if (PLACEHOLDER_SUMMARY.test(summary)) {
+    return `Grok returned a placeholder summary (${JSON.stringify(summary)}) instead of a review. The run produced no assessment, so this is a failed review rather than a clean one.`;
+  }
+
+  if (findings.length === 0 && IN_PROGRESS_SUMMARY.test(summary)) {
+    return "Grok's summary describes a review it was still working on rather than one it finished, and it reported no findings. The run ended before it reached a conclusion.";
+  }
+
+  // Only `approve` can carry an empty findings list. Flagging risk while
+  // reporting nothing to act on means the answer was cut off or never written.
+  if (findings.length === 0 && verdict && verdict !== "approve") {
+    return `Grok returned the verdict "${review.verdict}" with no findings. A non-approving verdict with nothing to act on means the review did not finish, so it cannot be read as "no issues found".`;
+  }
+
+  return null;
+}
+
 function parseReviewOutput(result) {
   const parsed = parseStructuredOutput(result.finalMessage, {
     status: result.status,
@@ -314,29 +366,46 @@ function parseReviewOutput(result) {
     };
   }
 
+  if (parsed.parsed) {
+    const unusableReason = findUnusableReviewReason(parsed.parsed);
+    if (unusableReason) {
+      return { ...parsed, parsed: null, parseError: unusableReason, unusableContent: true };
+    }
+  }
+
   return parsed;
 }
 
-function buildNativeReviewTarget(target) {
+function buildNativeReviewTarget(target, cwd = null) {
   if (target.mode === "working-tree") {
     return { type: "uncommittedChanges" };
   }
 
   if (target.mode === "branch") {
-    return { type: "baseBranch", branch: target.baseRef };
+    const nativeTarget = { type: "baseBranch", branch: target.baseRef };
+    if (!cwd) {
+      return nativeTarget;
+    }
+    try {
+      const range = getBranchReviewRange(cwd, target.baseRef);
+      return { ...nativeTarget, commitRange: range.commitRange, changedFiles: range.changedFiles };
+    } catch {
+      // An unresolvable base still reviews; it just cannot pin the range.
+      return nativeTarget;
+    }
   }
 
   return null;
 }
 
-function validateNativeReviewRequest(target, focusText) {
+function validateNativeReviewRequest(target, focusText, cwd = null) {
   if (focusText.trim()) {
     throw new Error(
       `\`/grok:review\` now maps directly to the built-in reviewer and does not support custom focus text. Retry with \`/grok:adversarial-review ${focusText.trim()}\` for focused review instructions.`
     );
   }
 
-  const nativeTarget = buildNativeReviewTarget(target);
+  const nativeTarget = buildNativeReviewTarget(target, cwd);
   if (!nativeTarget) {
     throw new Error("This `/grok:review` target is not supported by the built-in reviewer. Retry with `/grok:adversarial-review` for custom targeting.");
   }
@@ -429,7 +498,7 @@ async function executeReviewRun(request) {
   const focusText = request.focusText?.trim() ?? "";
   const reviewName = request.reviewName ?? "Review";
   if (reviewName === "Review") {
-    const reviewTarget = validateNativeReviewRequest(target, focusText);
+    const reviewTarget = validateNativeReviewRequest(target, focusText, request.cwd);
     const result = await runAppServerReview(request.cwd, {
       target: reviewTarget,
       model: request.model,
@@ -495,12 +564,14 @@ async function executeReviewRun(request) {
   // kept when the retry cannot do better.
   if ((!parsed.parsed || parsed.recovered) && result.threadId) {
     request.onProgress?.(
-      parsed.recovered
-        ? "Grok's JSON was incomplete and had to be repaired. Asking it to restate the review."
-        : "Grok returned unusable JSON. Asking it to re-emit the final object."
+      parsed.unusableContent
+        ? "Grok returned a placeholder instead of a review. Asking it to restate its actual assessment."
+        : parsed.recovered
+          ? "Grok's JSON was incomplete and had to be repaired. Asking it to restate the review."
+          : "Grok returned unusable JSON. Asking it to re-emit the final object."
     );
     const retry = await runAppServerTurn(context.repoRoot, {
-      prompt: REVIEW_REEMIT_PROMPT,
+      prompt: parsed.unusableContent ? REVIEW_RESTATE_PROMPT : REVIEW_REEMIT_PROMPT,
       resumeThreadId: result.threadId,
       model: request.model,
       sandbox: "read-only",
@@ -542,7 +613,10 @@ async function executeReviewRun(request) {
   };
 
   return {
-    exitStatus: result.status,
+    // A run that produced no usable review is a failed job, not a completed one
+    // with nothing to report. Without this the record reads `completed` and
+    // `/grok:status` presents a broken run as a finished review.
+    exitStatus: result.status !== 0 ? result.status : parsed.parsed ? 0 : 1,
     threadId: result.threadId,
     turnId: result.turnId,
     payload,
