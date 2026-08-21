@@ -250,6 +250,43 @@ if (BEHAVIOR === "review-truncated-allclear") {
   process.exit(0);
 }
 
+// The failure seen in the wild: the run ends cleanly, the object validates
+// against the schema, and it says nothing at all. Rendered naively it reads as
+// "needs-attention / No material findings" — a broken run wearing a clean bill.
+const PLACEHOLDER_REVIEW = { verdict: "needs-attention", summary: "PLACEHOLDER", findings: [], next_steps: [] };
+
+// The other shape of the same failure: the model narrating the review it has
+// not finished, with nothing to act on.
+const NARRATED_REVIEW = {
+  verdict: "needs-attention",
+  summary: "Adversarial review of branch vs trunk: investigating those paths for data-correctness hazards before any ship call.",
+  findings: [],
+  next_steps: []
+};
+
+if (BEHAVIOR === "review-placeholder" || BEHAVIOR === "review-narrated") {
+  // Emits the stub on every turn, so the restate retry cannot rescue it either.
+  const stub = BEHAVIOR === "review-placeholder" ? PLACEHOLDER_REVIEW : NARRATED_REVIEW;
+  emit({ type: "text", data: JSON.stringify(stub) });
+  emit({ type: "end", stopReason: "end_turn", sessionId, requestId: "req-fake" });
+  state.sessions.push(sessionId);
+  saveState(state);
+  process.exit(0);
+}
+
+if (BEHAVIOR === "review-placeholder-restated") {
+  // A stub first, then the real review once asked to restate it.
+  if (parsed.flags.resume) {
+    emit({ type: "text", data: JSON.stringify(REVIEW_OBJECT) });
+  } else {
+    emit({ type: "text", data: JSON.stringify(PLACEHOLDER_REVIEW) });
+  }
+  emit({ type: "end", stopReason: "end_turn", sessionId, requestId: "req-fake" });
+  state.sessions.push(sessionId);
+  saveState(state);
+  process.exit(0);
+}
+
 if (BEHAVIOR === "killed-mid-run") {
   // A process that dies from a signal reports a null exit code, which must not
   // read as success — /grok:cancel kills the tree exactly this way.

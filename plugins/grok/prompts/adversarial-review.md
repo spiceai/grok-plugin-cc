@@ -48,18 +48,21 @@ A finding should answer:
 <structured_output_contract>
 Return only valid JSON matching the provided schema.
 Keep the output compact and specific.
-Use `needs-attention` if there is any material risk worth blocking on.
+Use `needs-attention` if there is any material risk worth blocking on, and list every such risk as a finding.
 Use `approve` only if you cannot support any substantive adversarial finding from the provided context.
+`needs-attention` with an empty `findings` array is never a valid answer: if you have nothing to list, the verdict is `approve`.
 Every finding must include:
 - the affected file
 - `line_start` and `line_end`
 - a confidence score from 0 to 1
 - a concrete recommendation
 Write the summary like a terse ship/no-ship assessment, not a neutral recap.
+The summary must be your real conclusion. Never emit a placeholder token such as `PLACEHOLDER`, `TBD`, or `TODO`, and never describe work you are still doing ("investigating...", "will review..."). If you could not complete the review, say what stopped you in the summary and return `needs-attention` with a finding describing the gap.
 </structured_output_contract>
 
 <single_emission_rule>
 Emit the JSON object exactly once, as the very last thing you say.
+Only that final object is read. Anything you work out while thinking is discarded, so a review written in your reasoning and a stub in the answer is a lost run — put the real content in the object itself.
 Do not emit a draft, a partial object, a status object, or a "review in progress" object while you are still investigating. Everything you emit is captured, so an early draft is concatenated with the final answer and the combined text is not valid JSON.
 While working, either stay silent or write plain prose that is obviously not JSON. Never open a `{` until you are ready to emit the final answer.
 Do not repeat the object, wrap it in code fences, or add prose before or after it.
@@ -74,6 +77,7 @@ Running past the output budget truncates the JSON mid-object and loses the whole
 
 <grounding_rules>
 Be aggressive, but stay grounded.
+Stay inside the review scope stated above. Files outside it are not part of this change, and a finding against one is a wrong-scope review, not a finding.
 Every finding must be defensible from the provided repository context or tool outputs.
 Do not invent files, lines, code paths, incidents, attack chains, or runtime behavior you cannot support.
 If a conclusion depends on an inference, state that explicitly in the finding body and keep the confidence honest.
