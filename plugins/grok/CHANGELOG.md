@@ -32,6 +32,23 @@ reported that as a failed review, but it failed every time.
   file the model is told to read — which an inline diff regularly exceeds, and
   which a schema-constrained turn could never read. The `/grok:transfer` seed
   is sent the same way; it was losing all but its first 20 KB.
+- Reviews now verify their read-only promise instead of assuming it. The
+  `read-only` sandbox is a request the CLI drops silently when the kernel
+  policy cannot be applied, and headless stderr is quiet, so after every
+  review the companion reads the sandbox event log to learn whether the
+  profile was enforced and whether it actually covers the repository, and
+  fingerprints the working tree — every uncommitted change hashed per file,
+  untracked files, HEAD, and the hooks and config inside `.git` — before and
+  after the run. A review that ran unfenced, a repository the profile leaves
+  writable, or a tree that changed while the review ran is reported above the
+  findings, in the JSON payload, and in the `/grok:status` summary; a
+  multi-turn review reports its worst turn, since the first turn is where the
+  tools ran, and an outcome the log did not record is said to be unconfirmed
+  rather than implied clean. Measured on grok 1.0.13: Seatbelt does block
+  writes into a repository under `read-only`, but the profile keeps the system
+  temp directories writable by design, so a checkout under `/tmp` is not
+  fenced by it — and `--permission-mode dontAsk` does not stop shell writes on
+  its own.
 - A prompt longer than 24,000 characters is handed to Grok as a file
   (`--prompt-file`) instead of on argv. Windows caps the whole command line at
   32,767 characters, and an inline diff alone can run to 256 KB, so a review

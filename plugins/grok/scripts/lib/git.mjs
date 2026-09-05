@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -213,6 +214,129 @@ export function detectDefaultBranch(cwd) {
 
 export function getCurrentBranch(cwd) {
   return gitChecked(cwd, ["branch", "--show-current"]).stdout.trim() || "HEAD";
+}
+
+// Hashing the whole diff is what makes the fingerprint honest about files
+// that were already dirty; a diff past this size is skipped and those files
+// are covered by their status codes alone.
+const FINGERPRINT_DIFF_MAX_BYTES = 64 * 1024 * 1024;
+// A key no path can collide with, for the commit and ref HEAD points at.
+const FINGERPRINT_HEAD_KEY = "\0HEAD";
+
+/**
+ * A per-path fingerprint of everything uncommitted: the porcelain status code,
+ * a hash of each tracked change against HEAD, size plus mtime for untracked
+ * files, and the commit and ref HEAD points at. Taken before and after a
+ * review and compared, it catches a run that modified the tree — or committed,
+ * stashed, or checked something out — no matter what the sandbox did:
+ * `--sandbox` is a request the CLI drops silently when the kernel policy
+ * cannot be applied. Hooks and config inside `.git` are covered too, since a
+ * hook written there runs later on the user's own commands. Paths git ignores
+ * (build output, dependencies) are not.
+ *
+ * @returns {Map<string, string>}
+ */
+export function fingerprintWorkingTree(cwd) {
+  const entries = new Map();
+  const status = git(cwd, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+  if (status.error || status.status !== 0) {
+    return entries;
+  }
+  const records = status.stdout.split("\0");
+  for (let index = 0; index < records.length; index += 1) {
+    const record = records[index];
+    if (!record) {
+      continue;
+    }
+    const code = record.slice(0, 2);
+    const filePath = record.slice(3);
+    // A rename or copy is followed by the original path as a record of its own.
+    if (/[RC]/.test(code)) {
+      index += 1;
+    }
+    let detail = code;
+    if (code === "??") {
+      try {
+        const stat = fs.statSync(path.join(cwd, filePath));
+        detail = `${code} ${stat.size}@${Math.round(stat.mtimeMs)}`;
+      } catch {
+        detail = `${code} unreadable`;
+      }
+    }
+    entries.set(filePath, detail);
+  }
+
+  // Further edits to a tracked file that was already modified do not move its
+  // status code, and can keep its line counts too; the content of its diff
+  // cannot stay the same. Fails in a repository with no commits yet, where the
+  // status codes alone still catch anything new.
+  const diff = git(cwd, ["diff", "HEAD", "--no-ext-diff", "--binary"], { maxBuffer: FINGERPRINT_DIFF_MAX_BYTES });
+  if (!diff.error && diff.status === 0) {
+    for (const section of diff.stdout.split(/^(?=diff --git )/m)) {
+      if (!section.startsWith("diff --git ")) {
+        continue;
+      }
+      const header = section.slice(0, section.indexOf("\n"));
+      const filePath = /^diff --git a\/(.+?) b\/(.+)$/.exec(header)?.[2] ?? header;
+      const digest = createHash("sha256").update(section).digest("hex").slice(0, 16);
+      entries.set(filePath, `${entries.get(filePath) ?? "M "} ${digest}`);
+    }
+  }
+
+  // A commit, stash, checkout or branch switch can leave the tree looking
+  // untouched; HEAD moves.
+  const head = git(cwd, ["rev-parse", "--verify", "-q", "HEAD"]);
+  const ref = git(cwd, ["symbolic-ref", "-q", "HEAD"]);
+  entries.set(
+    FINGERPRINT_HEAD_KEY,
+    `${head.status === 0 ? head.stdout.trim() : "unborn"} ${ref.status === 0 ? ref.stdout.trim() : "detached"}`
+  );
+
+  // A hook or config written into .git shows nothing in the tree and runs
+  // later, on the user's own git commands.
+  const gitDir = git(cwd, ["rev-parse", "--git-dir"]);
+  if (gitDir.status === 0) {
+    const dir = path.resolve(cwd, gitDir.stdout.trim());
+    for (const candidate of [path.join(dir, "config"), ...listHooks(path.join(dir, "hooks"))]) {
+      try {
+        const stat = fs.statSync(candidate);
+        entries.set(`.git/${path.relative(dir, candidate)}`, `${stat.size}@${Math.round(stat.mtimeMs)}`);
+      } catch {
+        // Absent is fine; it only matters if it appears.
+      }
+    }
+  }
+  return entries;
+}
+
+function listHooks(hooksDir) {
+  try {
+    return fs
+      .readdirSync(hooksDir)
+      .filter((name) => !name.endsWith(".sample"))
+      .map((name) => path.join(hooksDir, name));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Paths whose fingerprint differs between two snapshots, sorted; a moved HEAD
+ * is reported as `HEAD`.
+ */
+export function diffWorkingTreeFingerprints(before, after) {
+  const changed = new Set();
+  for (const [filePath, detail] of before) {
+    if (after.get(filePath) !== detail) {
+      changed.add(filePath);
+    }
+  }
+  for (const [filePath, detail] of after) {
+    if (before.get(filePath) !== detail) {
+      changed.add(filePath);
+    }
+  }
+  return [...changed].map((filePath) => (filePath === FINGERPRINT_HEAD_KEY ? "HEAD" : filePath)).sort();
 }
 
 export function getWorkingTreeState(cwd) {

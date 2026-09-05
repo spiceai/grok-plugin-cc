@@ -28,6 +28,11 @@ const DEFAULT_GROK_BIN = "grok";
 // review diff alone can run to 256 KB. Past this length the prompt goes over
 // as a file instead of on argv.
 const PROMPT_FILE_THRESHOLD_CHARS = 24_000;
+// The sandbox event log is append-only across every session; only its tail
+// can concern a run that just finished.
+const SANDBOX_EVENTS_TAIL_BYTES = 256 * 1024;
+// Event timestamps come from the CLI's clock after ours took the start time.
+const SANDBOX_EVENT_SLACK_MS = 5_000;
 
 /**
  * @typedef {((update: string | { message: string, phase: string | null, threadId?: string | null, turnId?: string | null, stderrMessage?: string | null, logTitle?: string | null, logBody?: string | null }) => void)} ProgressReporter
@@ -398,6 +403,7 @@ export async function runGrokTurn(cwd, options = {}) {
   });
 
   emitProgress(options.onProgress, options.resumeSessionId || options.resumeThreadId ? `Resuming Grok session ${options.resumeSessionId || options.resumeThreadId}.` : "Starting Grok headless run.", "starting");
+  const startedAt = Date.now();
 
   return new Promise((resolve, reject) => {
     const child = spawn(bin, args, {
@@ -600,11 +606,17 @@ export async function runGrokTurn(cwd, options = {}) {
       // word of one into the first word of the next; a blank line keeps the
       // transcript readable and keeps adjacent JSON objects distinguishable.
       const finalMessage = messageSegments.join("\n\n") || (errorMessage ?? "");
+      // `applied: null` means the log had nothing to say, not that the fence
+      // was up.
+      const sandbox = options.sandbox
+        ? { requested: String(options.sandbox), applied: null, ...(readSandboxOutcome(env, cwd, startedAt, Date.now()) ?? {}) }
+        : null;
 
       resolve({
         status,
         threadId: sessionId,
         turnId: null,
+        sandbox,
         finalMessage,
         finalSegment,
         messageSegments,
@@ -721,6 +733,7 @@ export async function runAppServerReview(cwd, options = {}) {
     turnId: result.turnId,
     reviewText: result.finalMessage,
     reasoningSummary: result.reasoningSummary,
+    sandbox: result.sandbox,
     turn: null,
     error: result.error,
     stderr: result.stderr
@@ -1111,6 +1124,104 @@ export function parseStructuredOutput(rawOutput, fallback = {}) {
       : "Could not parse structured JSON from Grok output.",
     rawOutput,
     ...fallback
+  };
+}
+
+function canonicalPath(target) {
+  if (!target) {
+    return "";
+  }
+  try {
+    return fs.realpathSync.native(target);
+  } catch {
+    return path.resolve(target);
+  }
+}
+
+/**
+ * What the sandbox actually did for a run in `workspace` that started at
+ * `sinceMs` and ended at `untilMs`.
+ *
+ * `--sandbox` is a request, not a guarantee: when the kernel policy cannot be
+ * applied the CLI logs a warning and continues without enforcement, and
+ * headless stderr is quiet by default, so the event log in $GROK_HOME is the
+ * only record. Returns null when that log says nothing about this run (an
+ * older CLI, or logging off) — absence of evidence, not enforcement.
+ *
+ * The log is shared by every session, and its events carry no session id. The
+ * profile is applied at process startup, so of the events for this workspace
+ * inside the run's window the earliest is this run's; a later one belongs to
+ * whatever started next in the same tree. The log lives in $GROK_HOME, which
+ * every profile leaves writable, so a run could in principle append to it;
+ * the earliest-event rule means a forged entry cannot displace a genuine
+ * startup one, and the working-tree fingerprint does not depend on the log at
+ * all.
+ *
+ * @returns {{ profile: string | null, applied: boolean, workspaceWritable: boolean, platform: string | null, detail: string | null } | null}
+ */
+export function readSandboxOutcome(env, workspace, sinceMs, untilMs = Date.now()) {
+  const logPath = path.join(resolveGrokHome(env), "sandbox-events.jsonl");
+  let text;
+  try {
+    const { size } = fs.statSync(logPath);
+    text = readTailUtf8(logPath, size, Math.min(size, SANDBOX_EVENTS_TAIL_BYTES));
+  } catch {
+    return null;
+  }
+
+  const wanted = canonicalPath(workspace);
+  let chosen = null;
+  let chosenAt = Infinity;
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.trim()) {
+      continue;
+    }
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue; // The tail window can open mid-record.
+    }
+    if (event.event_type !== "ProfileApplied" && event.event_type !== "ApplyFailed") {
+      continue;
+    }
+    if (canonicalPath(event.workspace) !== wanted) {
+      continue;
+    }
+    const at = Date.parse(event.timestamp ?? "");
+    if (!Number.isFinite(at) || at < sinceMs - SANDBOX_EVENT_SLACK_MS || at > untilMs + SANDBOX_EVENT_SLACK_MS) {
+      continue;
+    }
+    if (at < chosenAt) {
+      chosen = event;
+      chosenAt = at;
+    }
+  }
+  if (!chosen) {
+    return null;
+  }
+
+  const applied = chosen.event_type === "ProfileApplied" && chosen.enforced !== false;
+  // Enforced is not the same as covering the tree: `read-only` keeps the
+  // system temp directories writable, so a checkout under /tmp is fenced by
+  // nothing at the OS level even though the profile applied.
+  const writableRoots = Array.isArray(chosen.read_write_paths) ? chosen.read_write_paths.map(canonicalPath).filter(Boolean) : [];
+  const writableRoot = applied
+    ? writableRoots.find((root) => {
+        const prefix = root.replace(/[\\/]+$/, "");
+        return wanted === prefix || wanted.startsWith(`${prefix}${path.sep}`);
+      })
+    : undefined;
+  return {
+    profile: chosen.profile ?? null,
+    applied,
+    workspaceWritable: Boolean(writableRoot),
+    platform: chosen.platform ?? null,
+    detail: !applied
+      ? String(chosen.error ?? chosen.reason ?? chosen.message ?? chosen.event_type)
+      : writableRoot
+        ? `the ${chosen.profile ?? "requested"} profile leaves ${writableRoot} writable and this repository is inside it`
+        : null
   };
 }
 

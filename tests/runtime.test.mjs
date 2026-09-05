@@ -418,6 +418,143 @@ test("a review prompt too long for argv is handed to grok as a file", () => {
 });
 
 /**
+ * `--sandbox read-only` is a request. When the kernel policy cannot be applied
+ * the CLI logs a warning and runs unfenced, and headless stderr is quiet, so
+ * the event log in $GROK_HOME is the only record. It is read after every
+ * review and the outcome travels with the result.
+ */
+test("a review reports the sandbox it ran under and an unchanged tree", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-ok");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+
+  assert.equal(payload.sandbox.requested, "read-only");
+  assert.equal(payload.sandbox.applied, true, "the event log said the profile was enforced");
+  assert.equal(payload.sandbox.profile, "read-only");
+  assert.deepEqual(payload.workingTreeChanges, []);
+});
+
+test("a review whose sandbox was not applied says so above its findings", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-sandbox-unapplied");
+  const env = buildEnv(binDir);
+  const pluginData = makeTempDir("plugin-data-");
+  env.CLAUDE_PLUGIN_DATA = pluginData;
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, "the findings are still real; the warning is about what else may have happened");
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.sandbox.applied, false);
+  assert.match(payload.sandbox.detail, /seatbelt unavailable/);
+  assert.equal(payload.result.findings.length, 1);
+
+  const rendered = run("node", [SCRIPT, "adversarial-review"], { cwd, env });
+  assert.match(rendered.stdout, /Warning: Grok ran without the `read-only` sandbox \(seatbelt unavailable/);
+  assert.match(rendered.stdout, /Verdict: needs-attention/, "the review itself is still shown");
+
+  const stateRoot = path.join(pluginData, "state");
+  const stateDir = path.join(stateRoot, fs.readdirSync(stateRoot)[0]);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.ok(
+    state.jobs.every((job) => /^Warning: ran without the read-only sandbox\./.test(job.summary)),
+    "the /grok:status line must carry the warning too"
+  );
+});
+
+/**
+ * Enforced is not the same as covering the tree: the real read-only profile
+ * keeps the system temp directories writable, so a checkout under /tmp is
+ * fenced by nothing at the OS level even though the profile applied.
+ */
+test("a sandbox that leaves the repository writable is reported as no fence", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-sandbox-writable-workspace");
+  const env = buildEnv(binDir);
+  const pluginData = makeTempDir("plugin-data-");
+  env.CLAUDE_PLUGIN_DATA = pluginData;
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.sandbox.applied, true);
+  assert.equal(payload.sandbox.workspaceWritable, true);
+  assert.match(payload.sandbox.detail, /leaves .* writable and this repository is inside it/);
+
+  const rendered = run("node", [SCRIPT, "adversarial-review"], { cwd, env });
+  assert.match(rendered.stdout, /Warning: the `read-only` sandbox was enforced, but the read-only profile leaves .* writable/);
+
+  const stateRoot = path.join(pluginData, "state");
+  const stateDir = path.join(stateRoot, fs.readdirSync(stateRoot)[0]);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.ok(state.jobs.every((job) => /^Warning: the read-only sandbox did not cover this repository\./.test(job.summary)));
+});
+
+/** Each turn is its own process; the one that ran the tools is the one that matters. */
+test("the sandbox outcome reported is the worst across a review's turns", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-sandbox-unapplied-first-turn");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+
+  assert.equal(grokRuns(binDir).length, 2, "the stub must have been restated");
+  assert.equal(payload.result.findings.length, 1, "the restated review is the answer");
+  assert.equal(payload.sandbox.applied, false, "but the unfenced first turn is what the report must carry");
+});
+
+/** No record is not a clean bill: the reader says so instead of staying quiet. */
+test("a review whose sandbox outcome was not recorded says it could not be confirmed", async () => {
+  const { renderReviewResult } = await import("../plugins/grok/scripts/lib/render.mjs");
+  const rendered = renderReviewResult(
+    { parsed: { verdict: "approve", summary: "Fine.", findings: [], next_steps: [] }, parseError: null },
+    { reviewLabel: "Adversarial Review", targetLabel: "working tree diff", sandbox: { requested: "read-only", applied: null } }
+  );
+  assert.match(rendered, /Note: Grok's sandbox event log has no record of whether the `read-only` sandbox was enforced/);
+  assert.match(rendered, /Verdict: approve/);
+});
+
+/**
+ * The tripwire behind the sandbox: the tree is fingerprinted before and after
+ * a review, so a run that wrote into it is caught whatever the sandbox did.
+ */
+test("a review that modified the working tree is flagged", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-writes-file");
+  const env = buildEnv(binDir);
+  const pluginData = makeTempDir("plugin-data-");
+  env.CLAUDE_PLUGIN_DATA = pluginData;
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(payload.workingTreeChanges, ["leaked.txt"]);
+
+  const rendered = run("node", [SCRIPT, "adversarial-review"], { cwd, env });
+  assert.match(rendered.stdout, /Warning: the working tree changed while this review ran \(1 path: leaked\.txt\)/);
+
+  const stateRoot = path.join(pluginData, "state");
+  const stateDir = path.join(stateRoot, fs.readdirSync(stateRoot)[0]);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.ok(
+    state.jobs.every((job) => /^Warning: the working tree changed during the review\./.test(job.summary)),
+    "the /grok:status line must carry the warning too"
+  );
+});
+
+/**
  * Nothing validates the unconstrained answer before the companion sees it, so
  * an object that parses but is not a review must go to the schema-constrained
  * re-emit instead of being rendered as one.

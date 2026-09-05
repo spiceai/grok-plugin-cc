@@ -15,6 +15,7 @@ export function installFakeGrok(binDir, behavior = "review-ok") {
   const scriptPath = path.join(binDir, "grok");
   const source = `#!/usr/bin/env node
 const fs = require("node:fs");
+const path = require("node:path");
 const crypto = require("node:crypto");
 
 const STATE_PATH = ${JSON.stringify(statePath)};
@@ -92,6 +93,35 @@ if (parsed.flags.prompt !== undefined) {
   state.argsHistory = [...(state.argsHistory || []), argv];
 }
 saveState(state);
+
+// The real CLI appends to $GROK_HOME/sandbox-events.jsonl whether the requested
+// profile was applied; the companion reads that log after a run.
+function recordSandboxEvent(eventType, extra) {
+  const home = process.env.GROK_HOME;
+  if (!home) {
+    return;
+  }
+  fs.mkdirSync(home, { recursive: true });
+  fs.appendFileSync(
+    path.join(home, "sandbox-events.jsonl"),
+    JSON.stringify(Object.assign(
+      { timestamp: new Date().toISOString(), event_type: eventType, profile: parsed.flags.sandbox, workspace: parsed.flags.cwd || process.cwd() },
+      extra
+    )) + "\\n"
+  );
+}
+if (parsed.flags.sandbox && parsed.flags.prompt !== undefined) {
+  const workspace = parsed.flags.cwd || process.cwd();
+  if (BEHAVIOR === "review-sandbox-unapplied" || (BEHAVIOR === "review-sandbox-unapplied-first-turn" && !parsed.flags.resume)) {
+    recordSandboxEvent("ApplyFailed", { error: "seatbelt unavailable in this environment" });
+  } else if (BEHAVIOR === "review-sandbox-writable-workspace") {
+    // Enforced, but the tree sits inside a path the profile keeps writable —
+    // what a checkout under /tmp gets from the real read-only profile.
+    recordSandboxEvent("ProfileApplied", { platform: "fake/none", enforced: true, restrict_network: true, read_write_paths: [path.dirname(workspace)] });
+  } else {
+    recordSandboxEvent("ProfileApplied", { platform: "fake/none", enforced: true, restrict_network: true });
+  }
+}
 
 if (parsed.flags.version || argv.includes("version")) {
   process.stdout.write("grok 0.0.0-fake\\n");
@@ -288,6 +318,22 @@ if (BEHAVIOR === "review-placeholder" || BEHAVIOR === "review-narrated") {
   process.exit(0);
 }
 
+if (BEHAVIOR === "review-sandbox-unapplied-first-turn") {
+  // The turn that ran the tools ran unfenced; the restate that produced the
+  // review ran fenced. The report has to carry the first.
+  if (parsed.flags.resume) {
+    emit({ type: "tool_call", toolCallId: "c1", title: "Shell", kind: "execute", status: "in_progress", toolName: "run_terminal_command", rawInput: { command: "git diff" } });
+    emit({ type: "tool_call_update", toolCallId: "c1", status: "completed", toolName: "run_terminal_command" });
+    emit({ type: "text", data: JSON.stringify(REVIEW_OBJECT) });
+  } else {
+    emit({ type: "text", data: JSON.stringify(PLACEHOLDER_REVIEW) });
+  }
+  emit({ type: "end", stopReason: "end_turn", sessionId, requestId: "req-fake" });
+  state.sessions.push(sessionId);
+  saveState(state);
+  process.exit(0);
+}
+
 if (BEHAVIOR === "review-placeholder-restated") {
   // A stub first, then the real review once asked to restate it.
   if (parsed.flags.resume) {
@@ -369,6 +415,20 @@ if (BEHAVIOR === "review-schema-blind") {
 }
 
 const BLIND_APPROVAL = { verdict: "approve", summary: "Nothing here looks risky.", findings: [], next_steps: [] };
+
+if (BEHAVIOR === "review-sandbox-unapplied" || BEHAVIOR === "review-writes-file" || BEHAVIOR === "review-sandbox-writable-workspace") {
+  if (BEHAVIOR === "review-writes-file") {
+    // What an unfenced shell makes possible: the review wrote into the tree.
+    fs.writeFileSync(path.join(parsed.flags.cwd || process.cwd(), "leaked.txt"), "written by the review\\n");
+  }
+  emit({ type: "tool_call", toolCallId: "c1", title: "Shell", kind: "execute", status: "in_progress", toolName: "run_terminal_command", rawInput: { command: "git diff" } });
+  emit({ type: "tool_call_update", toolCallId: "c1", status: "completed", toolName: "run_terminal_command" });
+  emit({ type: "text", data: JSON.stringify(REVIEW_OBJECT) });
+  emit({ type: "end", stopReason: "end_turn", sessionId, requestId: "req-fake" });
+  state.sessions.push(sessionId);
+  saveState(state);
+  process.exit(0);
+}
 
 if (BEHAVIOR === "review-blind-approve" || BEHAVIOR === "review-blind-always") {
   // An approval written from the file list: no tool call, then a clean bill.

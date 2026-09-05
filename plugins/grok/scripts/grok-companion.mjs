@@ -23,7 +23,14 @@ import {
   } from "./lib/grok.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
-import { collectReviewContext, ensureGitRepository, getBranchReviewRange, resolveReviewTarget } from "./lib/git.mjs";
+import {
+  collectReviewContext,
+  diffWorkingTreeFingerprints,
+  ensureGitRepository,
+  fingerprintWorkingTree,
+  getBranchReviewRange,
+  resolveReviewTarget
+} from "./lib/git.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
@@ -559,7 +566,7 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
 
 async function executeReviewRun(request) {
   ensureGrokAvailable(request.cwd);
-  ensureGitRepository(request.cwd);
+  const repoRoot = ensureGitRepository(request.cwd);
 
   const target = resolveReviewTarget(request.cwd, {
     base: request.base,
@@ -567,6 +574,11 @@ async function executeReviewRun(request) {
   });
   const focusText = request.focusText?.trim() ?? "";
   const reviewName = request.reviewName ?? "Review";
+  // A review promises not to touch the tree. The sandbox that backs that
+  // promise is a request the CLI drops silently when it cannot apply the
+  // kernel policy, so the tree is fingerprinted here and compared afterwards;
+  // any difference is reported above the findings.
+  const treeBefore = fingerprintWorkingTree(repoRoot);
   if (reviewName === "Review") {
     const reviewTarget = validateNativeReviewRequest(target, focusText, request.cwd);
     const result = await runAppServerReview(request.cwd, {
@@ -574,11 +586,14 @@ async function executeReviewRun(request) {
       model: request.model,
       onProgress: request.onProgress
     });
+    const workingTreeChanges = diffWorkingTreeFingerprints(treeBefore, fingerprintWorkingTree(repoRoot));
     const payload = {
       review: reviewName,
       target,
       threadId: result.threadId,
       sourceThreadId: result.sourceThreadId,
+      sandbox: result.sandbox ?? null,
+      workingTreeChanges,
       grok: {
         status: result.status,
         stderr: result.stderr,
@@ -592,7 +607,13 @@ async function executeReviewRun(request) {
         stdout: result.reviewText,
         stderr: result.stderr
       },
-      { reviewLabel: reviewName, targetLabel: target.label, reasoningSummary: result.reasoningSummary }
+      {
+        reviewLabel: reviewName,
+        targetLabel: target.label,
+        reasoningSummary: result.reasoningSummary,
+        sandbox: result.sandbox,
+        workingTreeChanges
+      }
     );
 
     return {
@@ -601,7 +622,11 @@ async function executeReviewRun(request) {
       turnId: result.turnId,
       payload,
       rendered,
-      summary: firstMeaningfulLine(result.reviewText, `${reviewName} completed.`),
+      summary: prefixIntegrityWarning(
+        workingTreeChanges,
+        result.sandbox,
+        firstMeaningfulLine(result.reviewText, `${reviewName} completed.`)
+      ),
       jobTitle: `Grok ${reviewName}`,
       jobClass: "review",
       targetLabel: target.label
@@ -631,6 +656,7 @@ async function executeReviewRun(request) {
     verbatim: true,
     onProgress: request.onProgress
   });
+  const sandboxOutcomes = [result.sandbox];
   const requireInspection = !context.inlinedEverything;
   let inspected = hasToolCalls(result);
   let parsed = parseReviewOutput(result, { schema, requireInspection: requireInspection && !inspected });
@@ -650,6 +676,7 @@ async function executeReviewRun(request) {
       onProgress: request.onProgress
     });
     inspected = inspected || hasToolCalls(restated);
+    sandboxOutcomes.push(restated.sandbox);
     result = { ...restated, reasoningSummary: [...result.reasoningSummary, ...restated.reasoningSummary] };
     parsed = parseReviewOutput(result, { schema, requireInspection: requireInspection && !inspected });
   }
@@ -684,6 +711,7 @@ async function executeReviewRun(request) {
       maxTurns: 1,
       onProgress: request.onProgress
     });
+    sandboxOutcomes.push(retry.sandbox);
     const retryParsed = parseReviewOutput(retry, { schema, requireInspection: requireInspection && !inspected });
     // Take the retry when it is a clean parse. When it also had to be salvaged
     // it is no more trustworthy than what we already had, so it only wins if the
@@ -694,6 +722,8 @@ async function executeReviewRun(request) {
       parsed = retryParsed;
     }
   }
+  const workingTreeChanges = diffWorkingTreeFingerprints(treeBefore, fingerprintWorkingTree(repoRoot));
+  const sandbox = worstSandboxOutcome(sandboxOutcomes);
   const payload = {
     review: reviewName,
     target,
@@ -703,6 +733,8 @@ async function executeReviewRun(request) {
       branch: context.branch,
       summary: context.summary
     },
+    sandbox,
+    workingTreeChanges,
     grok: {
       status: result.status,
       stderr: result.stderr,
@@ -728,9 +760,15 @@ async function executeReviewRun(request) {
     rendered: renderReviewResult(parsed, {
       reviewLabel: reviewName,
       targetLabel: context.target.label,
-      reasoningSummary: result.reasoningSummary
+      reasoningSummary: result.reasoningSummary,
+      sandbox,
+      workingTreeChanges
     }),
-    summary: parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
+    summary: prefixIntegrityWarning(
+      workingTreeChanges,
+      sandbox,
+      parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`)
+    ),
     jobTitle: `Grok ${reviewName}`,
     jobClass: "review",
     targetLabel: context.target.label
@@ -810,6 +848,40 @@ async function executeTaskRun(request) {
     jobClass: "task",
     write: Boolean(request.write)
   };
+}
+
+/**
+ * `/grok:status` shows one line per job. A review that ran unfenced, or that
+ * changed the tree, must not read as routine there.
+ */
+function prefixIntegrityWarning(workingTreeChanges, sandbox, summary) {
+  if (workingTreeChanges.length > 0) {
+    return `Warning: the working tree changed during the review. ${summary}`;
+  }
+  if (sandbox?.requested && sandbox.applied === false) {
+    return `Warning: ran without the ${sandbox.requested} sandbox. ${summary}`;
+  }
+  if (sandbox?.requested && sandbox.workspaceWritable) {
+    return `Warning: the ${sandbox.requested} sandbox did not cover this repository. ${summary}`;
+  }
+  return summary;
+}
+
+/**
+ * Every turn of a review is its own process with its own sandbox outcome, and
+ * the first turn is where the tools ran. Report the worst of them.
+ */
+function worstSandboxOutcome(outcomes) {
+  const known = outcomes.filter(Boolean);
+  if (known.length === 0) {
+    return null;
+  }
+  return (
+    known.find((outcome) => outcome.applied === false) ??
+    known.find((outcome) => outcome.workspaceWritable) ??
+    known.find((outcome) => outcome.applied == null) ??
+    known[0]
+  );
 }
 
 function buildReviewJobMetadata(reviewName, target) {
