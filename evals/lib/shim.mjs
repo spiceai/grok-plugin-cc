@@ -19,11 +19,28 @@ export function runTraceShim(realBinEnvVar, fallbackBin) {
   const traceLog = process.env.EVAL_TRACE_LOG;
   const realBin = process.env[realBinEnvVar] || fallbackBin;
 
+  // A prompt handed over as a file is deleted by the companion once the run
+  // ends, so its text has to be captured now for the grader to see it.
+  let promptFileText = null;
+  const promptFileIndex = argv.indexOf("--prompt-file");
+  if (promptFileIndex !== -1 && argv[promptFileIndex + 1]) {
+    try {
+      promptFileText = fs.readFileSync(argv[promptFileIndex + 1], "utf8");
+    } catch {
+      // Best effort, like the trace itself.
+    }
+  }
+
   if (traceLog) {
     try {
       fs.appendFileSync(
         traceLog,
-        `${JSON.stringify({ argv, cwd: process.cwd(), startedAt: new Date().toISOString() })}\n`
+        `${JSON.stringify({
+          argv,
+          cwd: process.cwd(),
+          startedAt: new Date().toISOString(),
+          ...(promptFileText !== null ? { promptFileText } : {})
+        })}\n`
       );
     } catch {
       // Tracing is best-effort. Never break the run being graded.

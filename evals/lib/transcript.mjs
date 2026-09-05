@@ -34,8 +34,9 @@ export function collectRunArtifacts(sessionId, traceLogPath, isCliInvocation = i
 }
 
 /**
- * A Grok "turn" is a real headless run (`grok -p <prompt> ...`). The companion
- * also shells out to `grok --version` for readiness checks; those are noise for
+ * A Grok "turn" is a real headless run (`grok -p <prompt> ...`, or
+ * `--prompt-file` when the prompt is too long for argv). The companion also
+ * shells out to `grok --version` for readiness checks; those are noise for
  * every assertion we care about, so they are filtered out here rather than in
  * each individual check.
  *
@@ -43,11 +44,11 @@ export function collectRunArtifacts(sessionId, traceLogPath, isCliInvocation = i
  */
 export function isGrokTurn(argv) {
   const args = Array.isArray(argv) ? argv : (argv?.argv ?? []);
-  return args.includes("-p") || args.includes("--single");
+  return args.includes("-p") || args.includes("--single") || args.includes("--prompt-file");
 }
 
 /**
- * @param {{argv: string[]}} call
+ * @param {{argv: string[], promptFileText?: string}} call
  * @returns {string}
  */
 export function grokPrompt(call) {
@@ -55,6 +56,10 @@ export function grokPrompt(call) {
   for (let i = 0; i < argv.length; i += 1) {
     if (argv[i] === "-p" || argv[i] === "--single") {
       return argv[i + 1] ?? "";
+    }
+    if (argv[i] === "--prompt-file") {
+      // The file is gone by grading time; the shim captured its text.
+      return call?.promptFileText ?? "";
     }
   }
   return "";

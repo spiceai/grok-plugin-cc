@@ -24,6 +24,12 @@ const TRANSFER_TAIL_INITIAL_BYTES = 1024 * 1024;
 const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current session state. Pick the next highest-value step and follow through until the task is resolved.";
 const DEFAULT_GROK_BIN = "grok";
+// Windows caps the whole command line at 32,767 characters, and an inline
+// review diff alone can run to 256 KB. Past this length the prompt goes over
+// as a file instead of on argv.
+const PROMPT_FILE_THRESHOLD_CHARS = 24_000;
+// A run appends a handful of sandbox events; this bounds a pathological one.
+const SANDBOX_EVENTS_MAX_BYTES = 16 * 1024 * 1024;
 
 /**
  * @typedef {((update: string | { message: string, phase: string | null, threadId?: string | null, turnId?: string | null, stderrMessage?: string | null, logTitle?: string | null, logBody?: string | null }) => void)} ProgressReporter
@@ -271,7 +277,10 @@ export async function getGrokAuthStatus(cwd, options = {}) {
  * Build argv for a headless Grok invocation.
  */
 export function buildGrokHeadlessArgs(prompt, options = {}) {
-  const args = ["-p", prompt, "--output-format", options.outputFormat ?? "streaming-json"];
+  // A prompt file stands in for `-p` when the prompt is too long for argv.
+  const args = options.promptFile
+    ? ["--prompt-file", options.promptFile, "--output-format", options.outputFormat ?? "streaming-json"]
+    : ["-p", prompt, "--output-format", options.outputFormat ?? "streaming-json"];
 
   if (options.cwd) {
     args.push("--cwd", options.cwd);
@@ -305,6 +314,10 @@ export function buildGrokHeadlessArgs(prompt, options = {}) {
     args.push("--max-turns", String(options.maxTurns));
   }
   if (options.outputSchema) {
+    // Grok constrains every assistant message with this, not only the final
+    // one, and a constrained grok-4.6 turn does not call tools: it emits a
+    // schema-shaped stub and stops. Only pass a schema for turns that need no
+    // tools — a re-emit of an answer the session already holds.
     args.push("--json-schema", typeof options.outputSchema === "string" ? options.outputSchema : JSON.stringify(options.outputSchema));
   }
   if (options.rules) {
@@ -351,8 +364,28 @@ export async function runGrokTurn(cwd, options = {}) {
   }
 
   const bin = resolveGrokBinary(env);
+  // `--verbatim` still applies to a prompt file, so nothing is truncated.
+  let promptDir = null;
+  let promptFile = null;
+  if (prompt.length > PROMPT_FILE_THRESHOLD_CHARS) {
+    promptDir = fs.mkdtempSync(path.join(os.tmpdir(), "grok-companion-prompt-"));
+    promptFile = path.join(promptDir, "prompt.txt");
+    fs.writeFileSync(promptFile, prompt, "utf8");
+  }
+  const discardPromptFile = () => {
+    if (!promptDir) {
+      return;
+    }
+    try {
+      fs.rmSync(promptDir, { recursive: true, force: true });
+    } catch {
+      // Best effort; the CLI has already read it.
+    }
+    promptDir = null;
+  };
   const args = buildGrokHeadlessArgs(prompt, {
     cwd,
+    promptFile,
     model: options.model,
     effort: options.effort,
     resumeSessionId: options.resumeSessionId ?? options.resumeThreadId ?? null,
@@ -367,6 +400,8 @@ export async function runGrokTurn(cwd, options = {}) {
   });
 
   emitProgress(options.onProgress, options.resumeSessionId || options.resumeThreadId ? `Resuming Grok session ${options.resumeSessionId || options.resumeThreadId}.` : "Starting Grok headless run.", "starting");
+  // Only what this run appends to the sandbox event log is read back.
+  const sandboxLogStart = options.sandbox ? sandboxLogOffset(env) : 0;
 
   return new Promise((resolve, reject) => {
     const child = spawn(bin, args, {
@@ -540,6 +575,7 @@ export async function runGrokTurn(cwd, options = {}) {
         return;
       }
       settled = true;
+      discardPromptFile();
       reject(error);
     });
 
@@ -552,6 +588,7 @@ export async function runGrokTurn(cwd, options = {}) {
         return;
       }
       settled = true;
+      discardPromptFile();
       // A run can end mid-thought or mid-message; keep those fragments.
       flushThought();
       closeSegment();
@@ -567,11 +604,21 @@ export async function runGrokTurn(cwd, options = {}) {
       // word of one into the first word of the next; a blank line keeps the
       // transcript readable and keeps adjacent JSON objects distinguishable.
       const finalMessage = messageSegments.join("\n\n") || (errorMessage ?? "");
+      // `applied: null` means the log had nothing to say, not that the fence
+      // was up.
+      const sandbox = options.sandbox
+        ? {
+            requested: String(options.sandbox),
+            applied: null,
+            ...(readSandboxOutcome(env, cwd, { offset: sandboxLogStart, profile: options.sandbox }) ?? {})
+          }
+        : null;
 
       resolve({
         status,
         threadId: sessionId,
         turnId: null,
+        sandbox,
         finalMessage,
         finalSegment,
         messageSegments,
@@ -688,6 +735,7 @@ export async function runAppServerReview(cwd, options = {}) {
     turnId: result.turnId,
     reviewText: result.finalMessage,
     reasoningSummary: result.reasoningSummary,
+    sandbox: result.sandbox,
     turn: null,
     error: result.error,
     stderr: result.stderr
@@ -810,6 +858,9 @@ export async function importExternalAgentSession(cwd, options = {}) {
   const result = await runGrokTurn(cwd, {
     prompt,
     write: false,
+    // Without this the CLI keeps only the first 20 KB of the seed and offloads
+    // the rest to a file — most of the transferred context, silently.
+    verbatim: true,
     onProgress: options.onProgress,
     env: options.env,
     maxTurns: 2
@@ -1075,6 +1126,143 @@ export function parseStructuredOutput(rawOutput, fallback = {}) {
       : "Could not parse structured JSON from Grok output.",
     rawOutput,
     ...fallback
+  };
+}
+
+function canonicalPath(target) {
+  if (!target) {
+    return "";
+  }
+  try {
+    return fs.realpathSync.native(target);
+  } catch {
+    return path.resolve(target);
+  }
+}
+
+function sandboxLogPath(env) {
+  return path.join(resolveGrokHome(env), "sandbox-events.jsonl");
+}
+
+/**
+ * Where the sandbox event log ends right now. Taken before a run is spawned so
+ * that only what the run appends is read afterwards.
+ */
+export function sandboxLogOffset(env) {
+  try {
+    return fs.statSync(sandboxLogPath(env)).size;
+  } catch {
+    return 0;
+  }
+}
+
+function readRangeUtf8(sourcePath, start, length) {
+  const buffer = Buffer.alloc(length);
+  const fd = fs.openSync(sourcePath, "r");
+  try {
+    fs.readSync(fd, buffer, 0, length, start);
+  } finally {
+    fs.closeSync(fd);
+  }
+  return buffer.toString("utf8");
+}
+
+/**
+ * What the sandbox actually did for a run in `workspace`, from the events the
+ * log gained after `offset` — the log's size when the run was spawned.
+ *
+ * `--sandbox` is a request, not a guarantee: when the kernel policy cannot be
+ * applied the CLI logs a warning and continues without enforcement, and
+ * headless stderr is quiet by default, so the event log in $GROK_HOME is the
+ * only record. Returns null when the run appended nothing about itself (an
+ * older CLI, or logging off) — absence of evidence, not enforcement.
+ *
+ * The log is shared by every session and its events carry no session id, so
+ * attribution is by append order: the profile is applied at process startup,
+ * so the first event this run appended for its workspace and profile is its
+ * own. Anything appended later that disagrees — a concurrent run in the same
+ * tree, or a record forged by an unfenced run into a log every profile leaves
+ * writable — makes the outcome ambiguous, which is reported as unconfirmed
+ * rather than resolved either way. The working-tree fingerprint does not
+ * depend on the log at all.
+ *
+ * @returns {{ profile: string | null, applied: boolean | null, workspaceWritable: boolean, platform: string | null, detail: string | null } | null}
+ */
+export function readSandboxOutcome(env, workspace, options = {}) {
+  const offset = Number(options.offset) || 0;
+  const requestedProfile = options.profile ? String(options.profile) : null;
+  let text;
+  try {
+    const logPath = sandboxLogPath(env);
+    const { size } = fs.statSync(logPath);
+    if (size <= offset) {
+      return null;
+    }
+    text = readRangeUtf8(logPath, offset, Math.min(size - offset, SANDBOX_EVENTS_MAX_BYTES));
+  } catch {
+    return null;
+  }
+
+  const wanted = canonicalPath(workspace);
+  const matches = [];
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.trim()) {
+      continue;
+    }
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue; // A record another process was mid-way through writing.
+    }
+    if (event.event_type !== "ProfileApplied" && event.event_type !== "ApplyFailed") {
+      continue;
+    }
+    if (canonicalPath(event.workspace) !== wanted) {
+      continue;
+    }
+    if (requestedProfile && event.profile && String(event.profile) !== requestedProfile) {
+      continue;
+    }
+    matches.push(event);
+  }
+  if (matches.length === 0) {
+    return null;
+  }
+
+  const enforced = (event) => event.event_type === "ProfileApplied" && event.enforced !== false;
+  const chosen = matches[0];
+  if (matches.some((event) => enforced(event) !== enforced(chosen))) {
+    return {
+      profile: chosen.profile ?? requestedProfile,
+      applied: null,
+      workspaceWritable: false,
+      platform: chosen.platform ?? null,
+      detail: `${matches.length} sandbox events for this workspace were appended during the run and disagree, so the outcome is ambiguous`
+    };
+  }
+
+  const applied = enforced(chosen);
+  // Enforced is not the same as covering the tree: `read-only` keeps the
+  // system temp directories writable, so a checkout under /tmp is fenced by
+  // nothing at the OS level even though the profile applied.
+  const writableRoots = Array.isArray(chosen.read_write_paths) ? chosen.read_write_paths.map(canonicalPath).filter(Boolean) : [];
+  const writableRoot = applied
+    ? writableRoots.find((root) => {
+        const prefix = root.replace(/[\\/]+$/, "");
+        return wanted === prefix || wanted.startsWith(`${prefix}${path.sep}`);
+      })
+    : undefined;
+  return {
+    profile: chosen.profile ?? null,
+    applied,
+    workspaceWritable: Boolean(writableRoot),
+    platform: chosen.platform ?? null,
+    detail: !applied
+      ? String(chosen.error ?? chosen.reason ?? chosen.message ?? chosen.event_type)
+      : writableRoot
+        ? `the ${chosen.profile ?? "requested"} profile leaves ${writableRoot} writable and this repository is inside it`
+        : null
   };
 }
 

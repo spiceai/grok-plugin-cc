@@ -105,7 +105,7 @@ Examples:
 /grok:review --background
 ```
 
-This command is read-only and will not perform any changes. When run in the background you can use [`/grok:status`](#grokstatus) to check on the progress and [`/grok:cancel`](#grokcancel) to cancel the ongoing task.
+This command is read-only and will not perform any changes: Grok runs under its `read-only` sandbox, and the companion checks afterwards that the sandbox was actually enforced and that the working tree is unchanged, warning above the output if either is not so. When run in the background you can use [`/grok:status`](#grokstatus) to check on the progress and [`/grok:cancel`](#grokcancel) to cancel the ongoing task.
 
 ### `/grok:adversarial-review`
 
@@ -124,7 +124,7 @@ Examples:
 /grok:adversarial-review --background look for race conditions and question the chosen approach
 ```
 
-This command is read-only. It does not fix code.
+This command is read-only. It does not fix code. Grok runs under its `read-only` sandbox, and the companion checks afterwards that the sandbox was actually enforced and that the working tree is unchanged, warning above the findings if either is not so.
 
 ### `/grok:rescue`
 

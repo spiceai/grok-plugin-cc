@@ -7,6 +7,11 @@ import { formatCommandFailure, runCommand, runCommandChecked } from "./process.m
 const MAX_UNTRACKED_BYTES = 24 * 1024;
 const DEFAULT_INLINE_DIFF_MAX_FILES = 2;
 const DEFAULT_INLINE_DIFF_MAX_BYTES = 256 * 1024;
+// Lightweight context still inlines untracked files — they are in no diff — but
+// only up to this much in total. The prompt reaches Grok whole, and a tree with
+// dozens of untracked files (generated reports, runtime workspaces) otherwise
+// inlines hundreds of kilobytes the model can read on demand instead.
+const DEFAULT_LIGHTWEIGHT_UNTRACKED_MAX_BYTES = 64 * 1024;
 
 // Git is directly executable on Windows. Repository-derived arguments must never pass through a shell.
 function git(cwd, args, options = {}) {
@@ -33,6 +38,14 @@ function normalizeMaxInlineDiffBytes(value) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 0) {
     return DEFAULT_INLINE_DIFF_MAX_BYTES;
+  }
+  return Math.floor(parsed);
+}
+
+function normalizeMaxUntrackedInlineBytes(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return DEFAULT_LIGHTWEIGHT_UNTRACKED_MAX_BYTES;
   }
   return Math.floor(parsed);
 }
@@ -202,6 +215,181 @@ export function getCurrentBranch(cwd) {
   return gitChecked(cwd, ["branch", "--show-current"]).stdout.trim() || "HEAD";
 }
 
+// A key no path can collide with, for the commit and ref HEAD points at.
+const FINGERPRINT_HEAD_KEY = "\0HEAD";
+
+function describeGitFailure(result) {
+  return result.error?.message ?? result.stderr.trim() ?? `exit ${result.status}`;
+}
+
+/**
+ * Size and mtime of what a path resolves to — through a symlink, so a write
+ * to the target counts — falling back to the link itself when it dangles.
+ */
+function statDetail(absolutePath) {
+  for (const probe of [fs.statSync, fs.lstatSync]) {
+    try {
+      const stat = probe(absolutePath);
+      return `${stat.size}@${Math.round(stat.mtimeMs)}`;
+    } catch {
+      // Try the next probe.
+    }
+  }
+  return "absent";
+}
+
+function isRegularFile(absolutePath) {
+  try {
+    return fs.statSync(absolutePath).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A per-path fingerprint of everything uncommitted: the porcelain status code
+ * and a content hash for every changed tracked file, size plus mtime for
+ * untracked files, the commit and ref HEAD points at, and the hooks and config
+ * git would run from. Taken before and after a review and compared, it catches
+ * a run that modified the tree — or committed, stashed, checked something out,
+ * or planted a hook — no matter what the sandbox did: `--sandbox` is a request
+ * the CLI drops silently when the kernel policy cannot be applied.
+ *
+ * Content is hashed by `git hash-object`, which streams each file, so there is
+ * no size past which the check quietly degrades; if any step fails the result
+ * says so and the comparison reports the tree as unverified rather than
+ * unchanged. Paths git ignores (build output, dependencies) are not covered.
+ *
+ * @returns {{ entries: Map<string, string>, incomplete: string | null }}
+ */
+export function fingerprintWorkingTree(cwd) {
+  const entries = new Map();
+  const status = git(cwd, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+  if (status.error || status.status !== 0) {
+    return { entries, incomplete: `git status failed: ${describeGitFailure(status)}` };
+  }
+
+  const toHash = [];
+  const records = status.stdout.split("\0");
+  for (let index = 0; index < records.length; index += 1) {
+    const record = records[index];
+    if (!record) {
+      continue;
+    }
+    const code = record.slice(0, 2);
+    const filePath = record.slice(3);
+    // A rename or copy is followed by the original path as a record of its own.
+    if (/[RC]/.test(code)) {
+      index += 1;
+    }
+    const absolutePath = path.join(cwd, filePath);
+    if (code === "??") {
+      entries.set(filePath, `?? ${statDetail(absolutePath)}`);
+    } else if (isRegularFile(absolutePath)) {
+      entries.set(filePath, code);
+      toHash.push(filePath);
+    } else {
+      // Deleted, a submodule, or a symlink: the status code and lstat cover it.
+      entries.set(filePath, `${code} ${statDetail(absolutePath)}`);
+    }
+  }
+
+  // Further edits to a tracked file that was already modified do not move its
+  // status code, and can keep its size and line counts too; its content hash
+  // cannot stay the same. One git process hashes every path.
+  if (toHash.length > 0) {
+    const hashed = git(cwd, ["hash-object", "--stdin-paths"], { input: `${toHash.join("\n")}\n` });
+    if (hashed.error || hashed.status !== 0) {
+      return { entries, incomplete: `git hash-object failed: ${describeGitFailure(hashed)}` };
+    }
+    const digests = hashed.stdout.trim().split("\n");
+    if (digests.length !== toHash.length) {
+      return { entries, incomplete: `git hash-object returned ${digests.length} digests for ${toHash.length} paths` };
+    }
+    toHash.forEach((filePath, index) => entries.set(filePath, `${entries.get(filePath)} ${digests[index]}`));
+  }
+
+  // A commit, stash, checkout or branch switch can leave the tree looking
+  // untouched; HEAD moves.
+  const head = git(cwd, ["rev-parse", "--verify", "-q", "HEAD"]);
+  const ref = git(cwd, ["symbolic-ref", "-q", "HEAD"]);
+  entries.set(
+    FINGERPRINT_HEAD_KEY,
+    `${head.status === 0 ? head.stdout.trim() : "unborn"} ${ref.status === 0 ? ref.stdout.trim() : "detached"}`
+  );
+
+  // A hook or config written into the git directory shows nothing in the tree
+  // and runs later, on the user's own git commands. In a linked worktree the
+  // hooks and shared config live in the common directory, the per-worktree
+  // config in the worktree's own; `core.hooksPath` can move the hooks anywhere.
+  const dirs = git(cwd, ["rev-parse", "--git-dir", "--git-common-dir"]);
+  if (dirs.error || dirs.status !== 0) {
+    return { entries, incomplete: `git rev-parse failed: ${describeGitFailure(dirs)}` };
+  }
+  const [gitDirRaw, commonDirRaw] = dirs.stdout.trim().split("\n");
+  const gitDir = path.resolve(cwd, gitDirRaw);
+  const commonDir = path.resolve(cwd, commonDirRaw ?? gitDirRaw);
+  const hooksPath = git(cwd, ["config", "--get", "core.hooksPath"]);
+  const hooksDir =
+    hooksPath.status === 0 && hooksPath.stdout.trim() ? path.resolve(cwd, hooksPath.stdout.trim()) : path.join(commonDir, "hooks");
+  const watched = new Set([path.join(commonDir, "config"), path.join(gitDir, "config.worktree"), ...listHooks(hooksDir)]);
+  for (const candidate of watched) {
+    try {
+      const stat = fs.statSync(candidate);
+      const inCommon = path.relative(commonDir, candidate);
+      const label = inCommon && !inCommon.startsWith("..") ? `.git/${inCommon}` : path.relative(cwd, candidate);
+      entries.set(label, `${stat.size}@${Math.round(stat.mtimeMs)}`);
+    } catch {
+      // Absent is fine; it only matters if it appears.
+    }
+  }
+  return { entries, incomplete: null };
+}
+
+function listHooks(hooksDir) {
+  try {
+    return fs
+      .readdirSync(hooksDir)
+      .filter((name) => !name.endsWith(".sample"))
+      .map((name) => path.join(hooksDir, name));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Compare two fingerprints: the paths whose entry differs, sorted, with a moved
+ * HEAD reported as `HEAD`; and, when either snapshot could not be completed,
+ * why — a partial comparison is not proof that nothing changed.
+ *
+ * An incomplete snapshot lacks the content hashes a complete one carries, so
+ * comparing the two in full would report every hashed path as edited. When
+ * either side is incomplete only the status codes are compared: new, deleted
+ * and re-staged paths still show, content changes are what the unverified
+ * flag is for.
+ *
+ * @returns {{ changed: string[], unverified: string | null }}
+ */
+export function diffWorkingTreeFingerprints(before, after) {
+  const unverified = before.incomplete ?? after.incomplete ?? null;
+  const comparable = (detail) => (unverified ? String(detail).split(" ")[0] : detail);
+  const changed = new Set();
+  for (const [filePath, detail] of before.entries) {
+    if (!after.entries.has(filePath) || comparable(after.entries.get(filePath)) !== comparable(detail)) {
+      changed.add(filePath);
+    }
+  }
+  for (const [filePath, detail] of after.entries) {
+    if (!before.entries.has(filePath) || comparable(before.entries.get(filePath)) !== comparable(detail)) {
+      changed.add(filePath);
+    }
+  }
+  return {
+    changed: [...changed].map((filePath) => (filePath === FINGERPRINT_HEAD_KEY ? "HEAD" : filePath)).sort(),
+    unverified
+  };
+}
+
 export function getWorkingTreeState(cwd) {
   const staged = gitChecked(cwd, ["diff", "--cached", "--name-only"]).stdout.trim().split("\n").filter(Boolean);
   const unstaged = gitChecked(cwd, ["diff", "--name-only"]).stdout.trim().split("\n").filter(Boolean);
@@ -277,32 +465,80 @@ function formatSection(title, body) {
   return [`## ${title}`, "", body.trim() ? body.trim() : "(none)", ""].join("\n");
 }
 
-function formatUntrackedFile(cwd, relativePath) {
+/**
+ * @returns {{ skipped: string } | { size: number, text: string }}
+ */
+function inspectUntrackedFile(cwd, relativePath) {
   const absolutePath = path.join(cwd, relativePath);
   let stat;
   try {
     stat = fs.statSync(absolutePath);
   } catch {
-    return `### ${relativePath}\n(skipped: broken symlink or unreadable file)`;
+    return { skipped: "broken symlink or unreadable file" };
   }
   if (stat.isDirectory()) {
-    return `### ${relativePath}\n(skipped: directory)`;
+    return { skipped: "directory" };
   }
   if (stat.size > MAX_UNTRACKED_BYTES) {
-    return `### ${relativePath}\n(skipped: ${stat.size} bytes exceeds ${MAX_UNTRACKED_BYTES} byte limit)`;
+    return { skipped: `${stat.size} bytes exceeds ${MAX_UNTRACKED_BYTES} byte limit`, oversized: true };
   }
 
   let buffer;
   try {
     buffer = fs.readFileSync(absolutePath);
   } catch {
-    return `### ${relativePath}\n(skipped: broken symlink or unreadable file)`;
+    return { skipped: "broken symlink or unreadable file" };
   }
   if (!isProbablyText(buffer)) {
-    return `### ${relativePath}\n(skipped: binary file)`;
+    return { skipped: "binary file" };
   }
 
-  return [`### ${relativePath}`, "```", buffer.toString("utf8").trimEnd(), "```"].join("\n");
+  return { size: buffer.length, text: buffer.toString("utf8").trimEnd() };
+}
+
+function formatUntrackedFileBlock(relativePath, file) {
+  if (file.skipped) {
+    return `### ${relativePath}\n(skipped: ${file.skipped})`;
+  }
+  return [`### ${relativePath}`, "```", file.text, "```"].join("\n");
+}
+
+/**
+ * Inline untracked files until `budgetBytes` is spent, then list the rest with
+ * their size for the model to read with its tools. Skipped entries (directories,
+ * binaries, oversized files) cost nothing and are always noted.
+ *
+ * `omitted` counts everything the prompt does not carry — text files past the
+ * budget or the per-file cap, and every skipped entry, since a binary, a
+ * nested repository, or an unreadable path is still part of the change — so
+ * the caller knows whether Grok must go and look.
+ */
+function renderUntrackedFiles(cwd, files, budgetBytes) {
+  let remaining = budgetBytes;
+  let inlined = 0;
+  let deferred = 0;
+  let omitted = 0;
+  const blocks = files.map((relativePath) => {
+    const file = inspectUntrackedFile(cwd, relativePath);
+    if (file.skipped) {
+      omitted += 1;
+      return formatUntrackedFileBlock(relativePath, file);
+    }
+    if (file.size > remaining) {
+      deferred += 1;
+      omitted += 1;
+      return `### ${relativePath}\n(${file.size} bytes; not inlined — read it with your file tools)`;
+    }
+    remaining -= file.size;
+    inlined += 1;
+    return formatUntrackedFileBlock(relativePath, file);
+  });
+  if (deferred > 0) {
+    blocks.unshift(
+      `${inlined} of ${inlined + deferred} untracked text file(s) are inlined below, within a ${budgetBytes} byte budget. The rest are listed with their size only: read each one with your file tools before judging it.`
+    );
+  }
+  return { body: blocks.join("\n\n"), omitted };
 }
 
 function collectWorkingTreeContext(cwd, state, options = {}) {
@@ -311,34 +547,44 @@ function collectWorkingTreeContext(cwd, state, options = {}) {
   const changedFiles = listUniqueFiles(state.staged, state.unstaged, state.untracked);
 
   let parts;
+  // Whether the prompt carries the whole change. When it does not, a review
+  // that never called a tool was written from the file list.
+  let inlinedEverything;
   if (includeDiff) {
     const stagedDiff = gitChecked(cwd, ["diff", "--cached", "--binary", "--no-ext-diff", "--submodule=diff"]).stdout;
     const unstagedDiff = gitChecked(cwd, ["diff", "--binary", "--no-ext-diff", "--submodule=diff"]).stdout;
-    const untrackedBody = state.untracked.map((file) => formatUntrackedFile(cwd, file)).join("\n\n");
+    const untracked = renderUntrackedFiles(cwd, state.untracked, Infinity);
     parts = [
       formatSection("Git Status", status),
       formatSection("Staged Diff", stagedDiff),
       formatSection("Unstaged Diff", unstagedDiff),
-      formatSection("Untracked Files", untrackedBody)
+      formatSection("Untracked Files", untracked.body)
     ];
+    inlinedEverything = untracked.omitted === 0;
   } else {
     const stagedStat = gitChecked(cwd, ["diff", "--shortstat", "--cached"]).stdout.trim();
     const unstagedStat = gitChecked(cwd, ["diff", "--shortstat"]).stdout.trim();
-    const untrackedBody = state.untracked.map((file) => formatUntrackedFile(cwd, file)).join("\n\n");
+    const untracked = renderUntrackedFiles(
+      cwd,
+      state.untracked,
+      normalizeMaxUntrackedInlineBytes(options.maxUntrackedInlineBytes)
+    );
     parts = [
       formatSection("Git Status", status),
       formatSection("Staged Diff Stat", stagedStat),
       formatSection("Unstaged Diff Stat", unstagedStat),
       formatSection("Changed Files", changedFiles.join("\n")),
-      formatSection("Untracked Files", untrackedBody)
+      formatSection("Untracked Files", untracked.body)
     ];
+    inlinedEverything = state.staged.length === 0 && state.unstaged.length === 0 && untracked.omitted === 0;
   }
 
   return {
     mode: "working-tree",
     summary: `Reviewing ${state.staged.length} staged, ${state.unstaged.length} unstaged, and ${state.untracked.length} untracked file(s).`,
     content: parts.join("\n"),
-    changedFiles
+    changedFiles,
+    inlinedEverything
   };
 }
 
@@ -368,7 +614,8 @@ function collectBranchContext(cwd, baseRef, options = {}) {
           formatSection("Changed Files", changedFiles.join("\n"))
         ].join("\n"),
     changedFiles,
-    comparison
+    comparison,
+    inlinedEverything: includeDiff
   };
 }
 
@@ -420,7 +667,7 @@ function buildAdversarialCollectionGuidance(options = {}) {
       "Scope is pinned to the uncommitted working tree: staged changes, unstaged changes, and untracked files.",
       includeDiff
         ? "The diff below is the complete contents of that scope."
-        : "Inspect it with `git diff --cached`, `git diff`, and the untracked files listed below. Do not review committed history."
+        : "Inspect it with `git diff --cached`, `git diff`, and the untracked files listed below. Untracked files appear in no diff: where one is listed without its contents, read it with your file tools. Do not review committed history."
     );
   }
 
@@ -455,7 +702,10 @@ export function collectReviewContext(cwd, target, options = {}) {
       options.includeDiff ??
       (listUniqueFiles(state.staged, state.unstaged, state.untracked).length <= maxInlineFiles &&
         diffBytes <= maxInlineDiffBytes);
-    details = collectWorkingTreeContext(repoRoot, state, { includeDiff });
+    details = collectWorkingTreeContext(repoRoot, state, {
+      includeDiff,
+      maxUntrackedInlineBytes: options.maxUntrackedInlineBytes
+    });
   } else {
     const comparison = buildBranchComparison(repoRoot, target.baseRef);
     const fileCount = gitChecked(repoRoot, ["diff", "--name-only", comparison.commitRange]).stdout.trim().split("\n").filter(Boolean).length;

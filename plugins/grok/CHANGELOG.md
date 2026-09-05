@@ -1,5 +1,69 @@
 # Changelog
 
+## 1.0.4
+
+`/grok:adversarial-review` never reviewed anything. Every run came back as
+"Review in progress" with no findings; the 1.0.3 integrity check correctly
+reported that as a failed review, but it failed every time.
+
+- The investigative turn no longer runs under `--json-schema`. Grok 1.0.13
+  applies that flag to every assistant message, and under it grok-4.6 does not
+  call a tool at all: it reasons about inspecting the diff, then its message is
+  forced into the schema shape and the turn ends with a stub. Resuming the
+  session under the same flag produced the same stub, so the restate retry could
+  not help either. The review now runs with the output schema in the prompt and
+  its tools free; `--json-schema` is used only for the tool-free re-emit turn,
+  where a constrained answer is exactly what is wanted.
+- With nothing constraining the investigation, the companion now does the
+  checking the CLI used to do. An object that does not satisfy
+  `review-output.schema.json` — a missing field, a verdict outside the enum, a
+  finding without one of its eight required fields, a value out of range — goes
+  to the schema-constrained re-emit instead of being rendered as a review, so
+  the JSON payload keeps honoring the schema. And when the change was not carried in the prompt — the lightweight
+  context for reviews over two files — an answer given without a single tool
+  call is treated as unfinished rather than accepted: an `approve` written from
+  the file list would otherwise read as a clean bill of health.
+- An unfinished review (a stub, or an answer given blind) is now sent back with
+  Grok's tools still available. The old restate retry ran under `--json-schema`
+  and so could never inspect anything; it could only repeat the stub. The
+  schema-constrained turn is reserved for re-emitting an answer the session
+  already holds.
+- Review prompts are sent with `--verbatim`. Without it the CLI truncates a
+  prompt of roughly 32 KB or more to its first 20 KB and offloads the rest to a
+  file the model is told to read — which an inline diff regularly exceeds, and
+  which a schema-constrained turn could never read. The `/grok:transfer` seed
+  is sent the same way; it was losing all but its first 20 KB.
+- Reviews now verify their read-only promise instead of assuming it. The
+  `read-only` sandbox is a request the CLI drops silently when the kernel
+  policy cannot be applied, and headless stderr is quiet, so after every
+  review the companion reads what the run appended to the sandbox event log
+  to learn whether the profile was enforced and whether it actually covers the
+  repository, and fingerprints the working tree — every changed tracked file
+  content-hashed by `git hash-object`, untracked files, HEAD, and the hooks
+  and config git would run from, in the common git directory of a linked
+  worktree too — before and after the run. A review that ran unfenced, a
+  repository the profile leaves writable, or a tree that changed while the
+  review ran is reported above the findings, in the JSON payload, and in the
+  `/grok:status` summary; a multi-turn review reports its worst turn, since
+  the first turn is where the tools ran; an outcome the log did not record, or
+  records that disagree, is said to be unconfirmed rather than implied clean;
+  and a fingerprint that could not be completed is reported as an unverified
+  tree, never as an unchanged one. Measured on grok 1.0.13: Seatbelt does block
+  writes into a repository under `read-only`, but the profile keeps the system
+  temp directories writable by design, so a checkout under `/tmp` is not
+  fenced by it — and `--permission-mode dontAsk` does not stop shell writes on
+  its own.
+- A prompt longer than 24,000 characters is handed to Grok as a file
+  (`--prompt-file`) instead of on argv. Windows caps the whole command line at
+  32,767 characters, and an inline diff alone can run to 256 KB, so a review
+  that size failed to spawn before Grok ever saw it.
+- Lightweight working-tree context caps the untracked file contents it inlines
+  at 64 KB in total. Untracked files are in no diff, so their contents still
+  travel with the prompt, but a tree with dozens of untracked files (generated
+  reports, runtime workspaces) was inlining several hundred kilobytes per
+  review. Past the budget, files are listed with their size for Grok to read
+  with its tools.
+
 ## 1.0.3
 
 Review-integrity fixes. Both defects made a broken review run look like a

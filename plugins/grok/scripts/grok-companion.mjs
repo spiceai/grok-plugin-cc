@@ -23,7 +23,14 @@ import {
   } from "./lib/grok.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
-import { collectReviewContext, ensureGitRepository, getBranchReviewRange, resolveReviewTarget } from "./lib/git.mjs";
+import {
+  collectReviewContext,
+  diffWorkingTreeFingerprints,
+  ensureGitRepository,
+  fingerprintWorkingTree,
+  getBranchReviewRange,
+  resolveReviewTarget
+} from "./lib/git.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
@@ -61,7 +68,8 @@ import {
   renderJobStatusReport,
   renderSetupReport,
   renderStatusReport,
-  renderTaskResult
+  renderTaskResult,
+  validateReviewResultShape
 } from "./lib/render.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -241,13 +249,16 @@ async function handleSetup(argv) {
   outputResult(options.json ? finalReport : renderSetupReport(finalReport), options.json);
 }
 
-function buildAdversarialReviewPrompt(context, focusText) {
+function buildAdversarialReviewPrompt(context, focusText, outputSchema) {
   const template = loadPromptTemplate(ROOT_DIR, "adversarial-review");
   return interpolateTemplate(template, {
     REVIEW_KIND: "Adversarial Review",
     TARGET_LABEL: context.target.label,
     USER_FOCUS: focusText || "No extra focus provided.",
     REVIEW_COLLECTION_GUIDANCE: context.collectionGuidance,
+    // The schema travels in the prompt rather than as `--json-schema`; see the
+    // note where the review turn is launched.
+    OUTPUT_SCHEMA: JSON.stringify(outputSchema, null, 2),
     REVIEW_INPUT: context.content
   });
 }
@@ -268,13 +279,136 @@ const REVIEW_REEMIT_PROMPT = [
 
 // Re-emitting is the wrong ask when the previous object parsed perfectly and
 // simply said nothing; repeating "emit valid JSON" invites the same stub back.
+// This turn runs with the tools available, because an unfinished review usually
+// means the change was never looked at.
 const REVIEW_RESTATE_PROMPT = [
-  "Your previous answer was valid JSON but was not a review: it was a placeholder or a description of work still in progress.",
-  "Emit the finished review now as exactly one JSON object matching the schema.",
+  "Your previous answer was not a finished review: it was a placeholder, a description of work still in progress, or a verdict given without inspecting the change.",
+  "If you have not yet inspected the change, do that now with your read-only tools: run git diff for the pinned scope, and read any listed file whose contents were not provided.",
+  "Then emit the finished review as exactly one JSON object matching the schema.",
   "The summary must be your actual assessment of the change, not a placeholder token and not a description of what you are about to do.",
   "Every concern you have must appear as a finding. Use verdict `needs-attention` only when you list at least one finding; if the change is genuinely clean, use `approve` and say why in the summary.",
-  "Output only that object: no prose, no code fences, no progress updates, and no second copy."
+  "Make that object your final message: no code fences, no progress updates, and no second copy."
 ].join("\n");
+
+// A review of a change that was not in the prompt, reached without a single
+// tool call, was written from the file list. With the investigation no longer
+// run under `--json-schema`, nothing else stops that from reading as a clean
+// bill of health.
+const UNINSPECTED_REVIEW_REASON =
+  "Grok answered without inspecting the change: parts of it were not in the prompt and Grok called no tool, so the verdict cannot rest on the code. The run produced no assessment.";
+
+/**
+ * Whether a turn looked at the repository at all. Under the read-only profile
+ * every tool Grok has left is an inspection tool, so any call counts.
+ *
+ * This is a coarse gate on purpose: it catches the answer given from the file
+ * list, which is the failure that was shipping. It does not prove every file
+ * left out of the prompt was read — tool arguments take too many shapes (a
+ * shell `cat`, a file read, a grep) to pin each path reliably.
+ */
+function hasToolCalls(result) {
+  return Array.isArray(result?.events) && result.events.some((event) => event?.type === "tool_call");
+}
+
+/**
+ * Enough of JSON Schema to check `review-output.schema.json`: types, required
+ * and additional properties, enums, numeric ranges, string and array lengths.
+ * Returns the first violation, or null.
+ */
+function findSchemaViolation(value, schema, location = "the review") {
+  if (!schema || typeof schema !== "object") {
+    return null;
+  }
+  switch (schema.type) {
+    case "object": {
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        return `${location} must be an object`;
+      }
+      for (const key of schema.required ?? []) {
+        if (!(key in value)) {
+          return `${location} is missing \`${key}\``;
+        }
+      }
+      for (const [key, child] of Object.entries(value)) {
+        const childSchema = schema.properties?.[key];
+        if (!childSchema) {
+          if (schema.additionalProperties === false) {
+            return `${location} has an unexpected \`${key}\``;
+          }
+          continue;
+        }
+        const violation = findSchemaViolation(child, childSchema, `${location}.${key}`);
+        if (violation) {
+          return violation;
+        }
+      }
+      return null;
+    }
+    case "array": {
+      if (!Array.isArray(value)) {
+        return `${location} must be an array`;
+      }
+      if (schema.maxItems != null && value.length > schema.maxItems) {
+        return `${location} has ${value.length} items; the schema allows ${schema.maxItems}`;
+      }
+      for (const [index, item] of value.entries()) {
+        const violation = findSchemaViolation(item, schema.items, `${location}[${index + 1}]`);
+        if (violation) {
+          return violation;
+        }
+      }
+      return null;
+    }
+    case "string": {
+      if (typeof value !== "string") {
+        return `${location} must be a string`;
+      }
+      if (Array.isArray(schema.enum) && !schema.enum.includes(value)) {
+        return `${location} is ${JSON.stringify(value)}; the schema allows ${schema.enum.map((option) => `\`${option}\``).join(" or ")}`;
+      }
+      if (schema.minLength != null && value.length < schema.minLength) {
+        return `${location} must not be empty`;
+      }
+      if (schema.maxLength != null && value.length > schema.maxLength) {
+        return `${location} is ${value.length} characters; the schema allows ${schema.maxLength}`;
+      }
+      return null;
+    }
+    case "integer":
+    case "number": {
+      if (typeof value !== "number" || !Number.isFinite(value) || (schema.type === "integer" && !Number.isInteger(value))) {
+        return `${location} must be ${schema.type === "integer" ? "an integer" : "a number"}`;
+      }
+      if (schema.minimum != null && value < schema.minimum) {
+        return `${location} is ${value}; the schema requires at least ${schema.minimum}`;
+      }
+      if (schema.maximum != null && value > schema.maximum) {
+        return `${location} is ${value}; the schema allows at most ${schema.maximum}`;
+      }
+      return null;
+    }
+    default:
+      return null;
+  }
+}
+
+/**
+ * Why a parsed object cannot be handed on as a review, or null.
+ *
+ * The investigation runs unconstrained, so nothing validated the object before
+ * it got here: this is the gate `--json-schema` used to be, and it checks the
+ * whole of `review-output.schema.json`, so the payload keeps honoring the
+ * schema. A miss is a formatting problem, which the schema-constrained re-emit
+ * exists to fix.
+ */
+function findMalformedReviewReason(review, schema) {
+  const shapeError = validateReviewResultShape(review);
+  if (shapeError) {
+    return `Grok's JSON was not a review. ${shapeError}`;
+  }
+  const violation = findSchemaViolation(review, schema);
+  return violation ? `Grok's JSON does not match the review schema: ${violation}.` : null;
+}
 
 /** A parsed object is only useful as a review if it carries the review fields. */
 function looksLikeReviewResult(value) {
@@ -347,7 +481,12 @@ function findUnusableReviewReason(review) {
   return null;
 }
 
-function parseReviewOutput(result) {
+/**
+ * @param {{ schema?: object, requireInspection?: boolean }} [options]
+ *   `requireInspection`: the prompt did not carry the whole change and the
+ *   session has not called a tool, so any answer was given blind.
+ */
+function parseReviewOutput(result, options = {}) {
   const parsed = parseStructuredOutput(result.finalMessage, {
     status: result.status,
     structuredOutput: result.structuredOutput,
@@ -367,10 +506,36 @@ function parseReviewOutput(result) {
   }
 
   if (parsed.parsed) {
-    const unusableReason = findUnusableReviewReason(parsed.parsed);
+    // `next_steps` is not load-bearing: an answer cut off before it, or a model
+    // that skipped it, still carries the review. Everything else missing is a
+    // shape problem worth a re-emit.
+    const review = { next_steps: [], ...parsed.parsed };
+    if (parsed.recovered && Array.isArray(review.findings)) {
+      // Salvage keeps only the findings that were written out whole; one cut
+      // mid-way is not evidence of anything. But a finding was being written,
+      // so an approval with none left is the model's concern erased by the
+      // cut, not an all-clear it gave.
+      const findingSchema = options.schema?.properties?.findings?.items;
+      const whole = review.findings.filter((finding) => !findSchemaViolation(finding, findingSchema, "finding"));
+      if (whole.length < review.findings.length && whole.length === 0 && !/needs.?attention|block|reject/i.test(String(review.verdict))) {
+        return {
+          ...parsed,
+          parsed: null,
+          parseError:
+            "Grok's review was cut off in the middle of a finding, so the only thing left to recover was an approval with no findings. Treating that as 'no issues found' would be wrong."
+        };
+      }
+      review.findings = whole;
+    }
+    const malformedReason = findMalformedReviewReason(review, options.schema);
+    if (malformedReason) {
+      return { ...parsed, parsed: null, parseError: malformedReason };
+    }
+    const unusableReason = findUnusableReviewReason(review) ?? (options.requireInspection ? UNINSPECTED_REVIEW_REASON : null);
     if (unusableReason) {
       return { ...parsed, parsed: null, parseError: unusableReason, unusableContent: true };
     }
+    return { ...parsed, parsed: review };
   }
 
   return parsed;
@@ -489,7 +654,7 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
 
 async function executeReviewRun(request) {
   ensureGrokAvailable(request.cwd);
-  ensureGitRepository(request.cwd);
+  const repoRoot = ensureGitRepository(request.cwd);
 
   const target = resolveReviewTarget(request.cwd, {
     base: request.base,
@@ -497,6 +662,11 @@ async function executeReviewRun(request) {
   });
   const focusText = request.focusText?.trim() ?? "";
   const reviewName = request.reviewName ?? "Review";
+  // A review promises not to touch the tree. The sandbox that backs that
+  // promise is a request the CLI drops silently when it cannot apply the
+  // kernel policy, so the tree is fingerprinted here and compared afterwards;
+  // any difference is reported above the findings.
+  const treeBefore = fingerprintWorkingTree(repoRoot);
   if (reviewName === "Review") {
     const reviewTarget = validateNativeReviewRequest(target, focusText, request.cwd);
     const result = await runAppServerReview(request.cwd, {
@@ -504,11 +674,16 @@ async function executeReviewRun(request) {
       model: request.model,
       onProgress: request.onProgress
     });
+    const treeCheck = diffWorkingTreeFingerprints(treeBefore, fingerprintWorkingTree(repoRoot));
+    const workingTreeChanges = treeCheck.changed;
     const payload = {
       review: reviewName,
       target,
       threadId: result.threadId,
       sourceThreadId: result.sourceThreadId,
+      sandbox: result.sandbox ?? null,
+      workingTreeChanges,
+      workingTreeUnverified: treeCheck.unverified,
       grok: {
         status: result.status,
         stderr: result.stderr,
@@ -522,7 +697,14 @@ async function executeReviewRun(request) {
         stdout: result.reviewText,
         stderr: result.stderr
       },
-      { reviewLabel: reviewName, targetLabel: target.label, reasoningSummary: result.reasoningSummary }
+      {
+        reviewLabel: reviewName,
+        targetLabel: target.label,
+        reasoningSummary: result.reasoningSummary,
+        sandbox: result.sandbox,
+        workingTreeChanges,
+        workingTreeUnverified: treeCheck.unverified
+      }
     );
 
     return {
@@ -531,7 +713,12 @@ async function executeReviewRun(request) {
       turnId: result.turnId,
       payload,
       rendered,
-      summary: firstMeaningfulLine(result.reviewText, `${reviewName} completed.`),
+      summary: prefixIntegrityWarning(
+        workingTreeChanges,
+        result.sandbox,
+        firstMeaningfulLine(result.reviewText, `${reviewName} completed.`),
+        treeCheck.unverified
+      ),
       jobTitle: `Grok ${reviewName}`,
       jobClass: "review",
       targetLabel: target.label
@@ -539,21 +726,60 @@ async function executeReviewRun(request) {
   }
 
   const context = collectReviewContext(request.cwd, target);
-  const prompt = buildAdversarialReviewPrompt(context, focusText);
   const schema = readOutputSchema(REVIEW_SCHEMA);
+  const prompt = buildAdversarialReviewPrompt(context, focusText, schema);
+  // The investigation runs without `--json-schema`. Grok applies that flag to
+  // every assistant message, and under it grok-4.6 never calls a tool: it
+  // reasons about inspecting the diff, then its message is forced into the
+  // schema shape and the turn ends with a "review in progress" stub — on every
+  // turn, so a resumed retry under the flag just repeats the stub. Every
+  // adversarial review failed this way. With the schema in the prompt instead,
+  // Grok can read the change and still answer in the requested shape; the flag
+  // is kept for the tool-free re-emit below, where a constrained answer is
+  // exactly what is wanted.
+  //
+  // `verbatim` keeps the prompt whole. Without it the CLI truncates anything
+  // over roughly 32 KB to its first 20 KB and offloads the rest to a file the
+  // model is told to read — which an inline diff regularly exceeds.
   let result = await runAppServerTurn(context.repoRoot, {
     prompt,
     model: request.model,
     sandbox: "read-only",
-    outputSchema: schema,
+    verbatim: true,
     onProgress: request.onProgress
   });
-  let parsed = parseReviewOutput(result);
+  const sandboxOutcomes = [result.sandbox];
+  const requireInspection = !context.inlinedEverything;
+  let inspected = hasToolCalls(result);
+  let parsed = parseReviewOutput(result, { schema, requireInspection: requireInspection && !inspected });
 
-  // Grok narrates between tool calls, and under a JSON schema that narration is
-  // itself JSON. Parsing already recovers the real answer from a run of drafts,
-  // but if even that fails the session is still warm and its context cached —
-  // one short "re-emit the JSON" turn is far cheaper than losing the review.
+  // A stub, or an answer given without looking at a change that was not in the
+  // prompt, means the investigation never finished. Ask again with the tools
+  // still available: a schema-constrained turn cannot inspect anything (see
+  // above), so it would only repeat the stub — which is exactly what the old
+  // restate retry did.
+  if ((parsed.unusableContent || (requireInspection && !inspected)) && result.threadId) {
+    request.onProgress?.("Grok's answer was not a finished review. Asking it to inspect the change and restate its assessment.");
+    const restated = await runAppServerTurn(context.repoRoot, {
+      prompt: REVIEW_RESTATE_PROMPT,
+      resumeThreadId: result.threadId,
+      model: request.model,
+      sandbox: "read-only",
+      onProgress: request.onProgress
+    });
+    inspected = inspected || hasToolCalls(restated);
+    sandboxOutcomes.push(restated.sandbox);
+    result = { ...restated, reasoningSummary: [...result.reasoningSummary, ...restated.reasoningSummary] };
+    parsed = parseReviewOutput(result, { schema, requireInspection: requireInspection && !inspected });
+  }
+
+  // Grok narrates between tool calls, so the answer can arrive wrapped in prose,
+  // fenced, trailing an earlier draft, or missing a field. Parsing already
+  // recovers the object from most of that, but if it still cannot be read the
+  // session is warm and holds the findings — one short "re-emit the JSON" turn
+  // is far cheaper than losing the review. That turn needs no tools, so it is
+  // the one place `--json-schema` is safe: it guarantees the shape without
+  // costing the investigation.
   //
   // A salvaged object counts as "still needs the retry". Closing the delimiters
   // of a half-written answer produces something that parses but was never
@@ -562,16 +788,14 @@ async function executeReviewRun(request) {
   // possible output for a review tool. Asking Grok to restate its answer costs
   // one cheap turn and yields something it actually said, so the salvage is only
   // kept when the retry cannot do better.
-  if ((!parsed.parsed || parsed.recovered) && result.threadId) {
+  if (!parsed.unusableContent && (!parsed.parsed || parsed.recovered) && result.threadId) {
     request.onProgress?.(
-      parsed.unusableContent
-        ? "Grok returned a placeholder instead of a review. Asking it to restate its actual assessment."
-        : parsed.recovered
-          ? "Grok's JSON was incomplete and had to be repaired. Asking it to restate the review."
-          : "Grok returned unusable JSON. Asking it to re-emit the final object."
+      parsed.recovered
+        ? "Grok's JSON was incomplete and had to be repaired. Asking it to restate the review."
+        : "Grok returned unusable JSON. Asking it to re-emit the final object."
     );
     const retry = await runAppServerTurn(context.repoRoot, {
-      prompt: parsed.unusableContent ? REVIEW_RESTATE_PROMPT : REVIEW_REEMIT_PROMPT,
+      prompt: REVIEW_REEMIT_PROMPT,
       resumeThreadId: result.threadId,
       model: request.model,
       sandbox: "read-only",
@@ -579,7 +803,8 @@ async function executeReviewRun(request) {
       maxTurns: 1,
       onProgress: request.onProgress
     });
-    const retryParsed = parseReviewOutput(retry);
+    sandboxOutcomes.push(retry.sandbox);
+    const retryParsed = parseReviewOutput(retry, { schema, requireInspection: requireInspection && !inspected });
     // Take the retry when it is a clean parse. When it also had to be salvaged
     // it is no more trustworthy than what we already had, so it only wins if the
     // first attempt produced nothing usable at all.
@@ -589,6 +814,9 @@ async function executeReviewRun(request) {
       parsed = retryParsed;
     }
   }
+  const treeCheck = diffWorkingTreeFingerprints(treeBefore, fingerprintWorkingTree(repoRoot));
+  const workingTreeChanges = treeCheck.changed;
+  const sandbox = worstSandboxOutcome(sandboxOutcomes);
   const payload = {
     review: reviewName,
     target,
@@ -598,6 +826,9 @@ async function executeReviewRun(request) {
       branch: context.branch,
       summary: context.summary
     },
+    sandbox,
+    workingTreeChanges,
+    workingTreeUnverified: treeCheck.unverified,
     grok: {
       status: result.status,
       stderr: result.stderr,
@@ -623,9 +854,17 @@ async function executeReviewRun(request) {
     rendered: renderReviewResult(parsed, {
       reviewLabel: reviewName,
       targetLabel: context.target.label,
-      reasoningSummary: result.reasoningSummary
+      reasoningSummary: result.reasoningSummary,
+      sandbox,
+      workingTreeChanges,
+      workingTreeUnverified: treeCheck.unverified
     }),
-    summary: parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
+    summary: prefixIntegrityWarning(
+      workingTreeChanges,
+      sandbox,
+      parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
+      treeCheck.unverified
+    ),
     jobTitle: `Grok ${reviewName}`,
     jobClass: "review",
     targetLabel: context.target.label
@@ -705,6 +944,43 @@ async function executeTaskRun(request) {
     jobClass: "task",
     write: Boolean(request.write)
   };
+}
+
+/**
+ * `/grok:status` shows one line per job. A review that ran unfenced, or that
+ * changed the tree, must not read as routine there.
+ */
+function prefixIntegrityWarning(workingTreeChanges, sandbox, summary, workingTreeUnverified = null) {
+  if (workingTreeChanges.length > 0) {
+    return `Warning: the working tree changed during the review. ${summary}`;
+  }
+  if (workingTreeUnverified) {
+    return `Warning: the working tree could not be verified after the review. ${summary}`;
+  }
+  if (sandbox?.requested && sandbox.applied === false) {
+    return `Warning: ran without the ${sandbox.requested} sandbox. ${summary}`;
+  }
+  if (sandbox?.requested && sandbox.workspaceWritable) {
+    return `Warning: the ${sandbox.requested} sandbox did not cover this repository. ${summary}`;
+  }
+  return summary;
+}
+
+/**
+ * Every turn of a review is its own process with its own sandbox outcome, and
+ * the first turn is where the tools ran. Report the worst of them.
+ */
+function worstSandboxOutcome(outcomes) {
+  const known = outcomes.filter(Boolean);
+  if (known.length === 0) {
+    return null;
+  }
+  return (
+    known.find((outcome) => outcome.applied === false) ??
+    known.find((outcome) => outcome.workspaceWritable) ??
+    known.find((outcome) => outcome.applied == null) ??
+    known[0]
+  );
 }
 
 function buildReviewJobMetadata(reviewName, target) {

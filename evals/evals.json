@@ -268,7 +268,7 @@
       "dimension": "review-discipline",
       "fixture": "ttl-cache",
       "prompt": "/grok:adversarial-review --wait focus on the cache expiry logic",
-      "expected_output": "Grok runs once under the JSON schema, the companion parses its structured answer without falling back to a parse error, and the findings reach the user. Nothing on disk changes.",
+      "expected_output": "Grok runs once, unconstrained so it can inspect the change, with the output schema carried in the prompt; the companion parses its answer without falling back to a parse error, and the findings reach the user. Nothing on disk changes.",
       "assertions": [
         {
           "id": "invokes-grok-exactly-once",
@@ -283,16 +283,30 @@
           "pattern": "refusing to start|could not apply the '|sandbox could not be applied|sandbox profile '[^']*' not found"
         },
         {
-          "id": "uses-the-structured-output-schema",
-          "text": "Drives the run through Grok's structured-output mode, which is what separates adversarial review from native review",
-          "check": "grok_argv_sequence",
+          "id": "investigation-not-schema-constrained",
+          "text": "The investigative turn does not run under --json-schema. Grok applies that flag to every assistant message, and a constrained grok-4.6 turn never calls a tool: it emits a 'review in progress' stub and stops, so the review can never inspect the change.",
+          "check": "grok_argv_absent",
           "tokens": [
             "--json-schema"
           ]
         },
         {
+          "id": "schema-carried-in-the-prompt",
+          "text": "The output schema travels in the prompt instead, which is what separates adversarial review from native review",
+          "check": "grok_prompt_matches",
+          "pattern": "<output_schema>"
+        },
+        {
+          "id": "prompt-sent-whole",
+          "text": "The prompt is sent verbatim. Without --verbatim the CLI truncates a prompt over ~32 KB to its first 20 KB and offloads the rest to a file the model is told to read.",
+          "check": "grok_argv_sequence",
+          "tokens": [
+            "--verbatim"
+          ]
+        },
+        {
           "id": "structured-output-parsed",
-          "text": "The companion parses Grok's answer instead of reporting malformed JSON. Grok narrates between tool calls, and under a schema that narration is itself JSON, so a whole-stream parse sees several objects glued together and fails.",
+          "text": "The companion parses Grok's answer instead of reporting malformed JSON. Unconstrained, Grok can wrap the object in prose or fences or trail an earlier draft, and the parser has to recover the object from all of those.",
           "check": "helper_output_not_matches",
           "pattern": "did not return valid structured JSON|Could not parse structured JSON|unexpected review shape|Grok did not return a final structured message"
         },

@@ -21,7 +21,7 @@ function formatLineRange(finding) {
   return `:${finding.line_start}-${finding.line_end}`;
 }
 
-function validateReviewResultShape(data) {
+export function validateReviewResultShape(data) {
   if (!data || typeof data !== "object" || Array.isArray(data)) {
     return "Expected a top-level JSON object.";
   }
@@ -221,11 +221,50 @@ export function renderSetupReport(report) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
+/**
+ * Lines that belong above a review whenever its read-only promise cannot be
+ * vouched for. `--sandbox` is a request the CLI drops silently when the kernel
+ * policy cannot be applied, so the fence is checked from the event log and the
+ * tree is compared before and after; either failing is worth more than the
+ * findings below it.
+ */
+function reviewIntegrityWarnings(meta = {}) {
+  const lines = [];
+  const sandbox = meta.sandbox;
+  if (sandbox?.requested && sandbox.applied === false) {
+    lines.push(
+      `Warning: Grok ran without the \`${sandbox.requested}\` sandbox${sandbox.detail ? ` (${sandbox.detail})` : ""}. Nothing at the OS level fenced its shell, so check \`git status\` before trusting that this review changed nothing.`
+    );
+  } else if (sandbox?.requested && sandbox.workspaceWritable) {
+    lines.push(
+      `Warning: the \`${sandbox.requested}\` sandbox was enforced, but ${sandbox.detail}. Nothing at the OS level fenced Grok's shell here, so check \`git status\` before trusting that this review changed nothing.`
+    );
+  } else if (sandbox?.requested && sandbox.applied == null) {
+    lines.push(
+      `Note: whether the \`${sandbox.requested}\` sandbox was enforced for this run could not be confirmed from Grok's sandbox event log${sandbox.detail ? ` (${sandbox.detail})` : ""}.`
+    );
+  }
+  if (meta.workingTreeUnverified) {
+    lines.push(
+      `Warning: the working tree could not be verified after this review (${meta.workingTreeUnverified}), so a change made during it would not have been detected. Check \`git status\` before trusting the result.`
+    );
+  }
+  const changes = Array.isArray(meta.workingTreeChanges) ? meta.workingTreeChanges : [];
+  if (changes.length > 0) {
+    const listed = changes.slice(0, 20).join(", ") + (changes.length > 20 ? ", …" : "");
+    lines.push(
+      `Warning: the working tree changed while this review ran (${changes.length} path${changes.length === 1 ? "" : "s"}: ${listed}). A review must not modify anything; if these are not your own edits, inspect them with \`git diff\` before trusting the result.`
+    );
+  }
+  return lines.length > 0 ? [...lines, ""] : [];
+}
+
 export function renderReviewResult(parsedResult, meta) {
   if (!parsedResult.parsed) {
     const lines = [
       `# Grok ${meta.reviewLabel}`,
       "",
+      ...reviewIntegrityWarnings(meta),
       "Grok did not return valid structured JSON.",
       "",
       `- Parse error: ${parsedResult.parseError}`
@@ -245,6 +284,7 @@ export function renderReviewResult(parsedResult, meta) {
     const lines = [
       `# Grok ${meta.reviewLabel}`,
       "",
+      ...reviewIntegrityWarnings(meta),
       `Target: ${meta.targetLabel}`,
       "Grok returned JSON with an unexpected review shape.",
       "",
@@ -265,6 +305,7 @@ export function renderReviewResult(parsedResult, meta) {
   const lines = [
     `# Grok ${meta.reviewLabel}`,
     "",
+    ...reviewIntegrityWarnings(meta),
     `Target: ${meta.targetLabel}`,
     `Verdict: ${data.verdict}`,
     ""
@@ -308,6 +349,7 @@ export function renderNativeReviewResult(result, meta) {
   const lines = [
     `# Grok ${meta.reviewLabel}`,
     "",
+    ...reviewIntegrityWarnings(meta),
     `Target: ${meta.targetLabel}`,
     ""
   ];

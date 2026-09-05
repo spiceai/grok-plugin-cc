@@ -118,7 +118,7 @@ test("native review returns grok output for working tree changes", () => {
   assert.ok(payload.threadId);
 });
 
-test("adversarial review returns structured findings when schema is used", () => {
+test("adversarial review returns structured findings", () => {
   const binDir = makeTempDir();
   installFakeGrok(binDir, "review-ok");
   const env = buildEnv(binDir);
@@ -209,6 +209,28 @@ test("adversarial review refuses a salvaged all-clear and restates the review in
 });
 
 /**
+ * Salvage keeps only whole findings. When the cut lands inside the only
+ * finding under an approving verdict, what is left is an approval with no
+ * findings — the model's concern erased by the cut — and it must not ship.
+ */
+test("a salvaged approval whose only finding was cut off is restated, not shipped", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-truncated-approve-mid-finding");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+
+  assert.equal(payload.parseError, null);
+  assert.equal(payload.result.verdict, "needs-attention", "the re-emitted review replaced the salvage");
+  assert.equal(payload.result.findings.length, 1);
+  assert.equal(grokRuns(binDir).length, 2, "the salvage must have been sent back");
+});
+
+/**
  * The failure this guards against was observed three runs running: Grok ended
  * its turn with `{"verdict":"needs-attention","summary":"PLACEHOLDER",
  * "findings":[]}`. It parses, it validates against the schema, and it renders
@@ -279,6 +301,12 @@ test("a placeholder review is restated rather than lost when grok can still answ
   assert.equal(payload.parseError, null);
   assert.notEqual(payload.result.summary, "PLACEHOLDER");
   assert.ok(payload.result.findings.length > 0);
+
+  // A stub means the change was never looked at, and a turn under
+  // `--json-schema` cannot look — so the restate has to run unconstrained.
+  const [, restate] = grokRuns(binDir);
+  assert.ok(restate.includes("--resume"));
+  assert.ok(!restate.includes("--json-schema"), "the restate must leave grok free to inspect");
 });
 
 /**
@@ -301,6 +329,331 @@ test("a grok process killed by a signal is reported as a failure, not a complete
   assert.match(result.error.message, /signal/i);
 });
 
+function grokRuns(binDir) {
+  return JSON.parse(fs.readFileSync(path.join(binDir, "fake-grok-state.json"), "utf8")).argsHistory;
+}
+
+/** Three modified files: over the inline threshold, so the diff is not in the prompt. */
+function prepareLightweightRepo() {
+  const cwd = makeTempDir("grok-repo-lite-");
+  initGitRepo(cwd);
+  for (const name of ["a.js", "b.js", "c.js"]) {
+    fs.writeFileSync(path.join(cwd, name), `export const value = "${name}-v1";\n`);
+  }
+  run("git", ["add", "."], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  for (const name of ["a.js", "b.js", "c.js"]) {
+    fs.writeFileSync(path.join(cwd, name), `export const value = "${name}-v2";\n`);
+  }
+  return cwd;
+}
+
+/**
+ * With the investigation unconstrained, an approval can be written from the
+ * file list alone. When the change was not in the prompt, a review that never
+ * called a tool has to be sent back to look — with its tools, not under the
+ * schema flag that stops it from looking.
+ */
+test("a review answered without inspecting an uninlined change is sent back to look", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-blind-approve");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareLightweightRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+
+  assert.equal(payload.parseError, null);
+  assert.equal(payload.result.verdict, "needs-attention", "the blind approval must not be the answer");
+  assert.equal(payload.result.findings.length, 1);
+
+  const [investigation, restate] = grokRuns(binDir);
+  assert.ok(!investigation.includes("--json-schema"));
+  assert.ok(restate.includes("--resume"), "the restate must continue the same session");
+  assert.ok(!restate.includes("--json-schema"), "a turn that still has to inspect must not be schema-constrained");
+  assert.ok(!restate.includes("--max-turns"), "a turn that still has to inspect must be free to call tools");
+});
+
+test("a review that never inspects an uninlined change is a failure, not an approval", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-blind-always");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareLightweightRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  const payload = JSON.parse(result.stdout);
+
+  assert.notEqual(result.status, 0, "an approval given blind must not exit clean");
+  assert.equal(payload.result, null);
+  assert.match(payload.parseError, /without inspecting/i);
+  assert.equal(grokRuns(binDir).length, 2, "one restate, then give up");
+});
+
+/** The guard must not fire when the prompt already carried the whole change. */
+test("an approval given from an inline diff needs no tool call", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-blind-always");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+
+  assert.equal(payload.parseError, null);
+  assert.equal(payload.result.verdict, "approve");
+  assert.equal(grokRuns(binDir).length, 1);
+});
+
+/**
+ * Windows caps a command line at 32,767 characters, and an inline review diff
+ * alone can run to 256 KB — a prompt that size on argv fails to spawn before
+ * Grok ever sees it. Past a threshold the prompt is handed over as a file.
+ */
+test("a review prompt too long for argv is handed to grok as a file", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-ok");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+  // One tracked change plus one ~21 KB untracked file: still inline mode, and
+  // still under the per-file cap, but the prompt now exceeds what a Windows
+  // command line can carry.
+  fs.writeFileSync(path.join(cwd, "generated.txt"), `${"x".repeat(80)}\n`.repeat(260));
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.parseError, null);
+  assert.equal(payload.result.findings.length, 1);
+
+  const [investigation] = grokRuns(binDir);
+  assert.ok(!investigation.includes("-p"), "a prompt this long must not ride on argv");
+  const promptFile = investigation[investigation.indexOf("--prompt-file") + 1];
+  assert.ok(promptFile, "the prompt must be handed over as a file");
+  assert.ok(investigation.includes("--verbatim"), "the file must still be sent whole");
+  assert.ok(!fs.existsSync(promptFile), "the prompt file must be cleaned up after the run");
+});
+
+/**
+ * `--sandbox read-only` is a request. When the kernel policy cannot be applied
+ * the CLI logs a warning and runs unfenced, and headless stderr is quiet, so
+ * the event log in $GROK_HOME is the only record. It is read after every
+ * review and the outcome travels with the result.
+ */
+test("a review reports the sandbox it ran under and an unchanged tree", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-ok");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+
+  assert.equal(payload.sandbox.requested, "read-only");
+  assert.equal(payload.sandbox.applied, true, "the event log said the profile was enforced");
+  assert.equal(payload.sandbox.profile, "read-only");
+  assert.deepEqual(payload.workingTreeChanges, []);
+});
+
+test("a review whose sandbox was not applied says so above its findings", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-sandbox-unapplied");
+  const env = buildEnv(binDir);
+  const pluginData = makeTempDir("plugin-data-");
+  env.CLAUDE_PLUGIN_DATA = pluginData;
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, "the findings are still real; the warning is about what else may have happened");
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.sandbox.applied, false);
+  assert.match(payload.sandbox.detail, /seatbelt unavailable/);
+  assert.equal(payload.result.findings.length, 1);
+
+  const rendered = run("node", [SCRIPT, "adversarial-review"], { cwd, env });
+  assert.match(rendered.stdout, /Warning: Grok ran without the `read-only` sandbox \(seatbelt unavailable/);
+  assert.match(rendered.stdout, /Verdict: needs-attention/, "the review itself is still shown");
+
+  const stateRoot = path.join(pluginData, "state");
+  const stateDir = path.join(stateRoot, fs.readdirSync(stateRoot)[0]);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.ok(
+    state.jobs.every((job) => /^Warning: ran without the read-only sandbox\./.test(job.summary)),
+    "the /grok:status line must carry the warning too"
+  );
+});
+
+/**
+ * Enforced is not the same as covering the tree: the real read-only profile
+ * keeps the system temp directories writable, so a checkout under /tmp is
+ * fenced by nothing at the OS level even though the profile applied.
+ */
+test("a sandbox that leaves the repository writable is reported as no fence", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-sandbox-writable-workspace");
+  const env = buildEnv(binDir);
+  const pluginData = makeTempDir("plugin-data-");
+  env.CLAUDE_PLUGIN_DATA = pluginData;
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.sandbox.applied, true);
+  assert.equal(payload.sandbox.workspaceWritable, true);
+  assert.match(payload.sandbox.detail, /leaves .* writable and this repository is inside it/);
+
+  const rendered = run("node", [SCRIPT, "adversarial-review"], { cwd, env });
+  assert.match(rendered.stdout, /Warning: the `read-only` sandbox was enforced, but the read-only profile leaves .* writable/);
+
+  const stateRoot = path.join(pluginData, "state");
+  const stateDir = path.join(stateRoot, fs.readdirSync(stateRoot)[0]);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.ok(state.jobs.every((job) => /^Warning: the read-only sandbox did not cover this repository\./.test(job.summary)));
+});
+
+/** Each turn is its own process; the one that ran the tools is the one that matters. */
+test("the sandbox outcome reported is the worst across a review's turns", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-sandbox-unapplied-first-turn");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+
+  assert.equal(grokRuns(binDir).length, 2, "the stub must have been restated");
+  assert.equal(payload.result.findings.length, 1, "the restated review is the answer");
+  assert.equal(payload.sandbox.applied, false, "but the unfenced first turn is what the report must carry");
+});
+
+/** No record is not a clean bill: the reader says so instead of staying quiet. */
+test("a review whose sandbox outcome was not recorded says it could not be confirmed", async () => {
+  const { renderReviewResult } = await import("../plugins/grok/scripts/lib/render.mjs");
+  const rendered = renderReviewResult(
+    { parsed: { verdict: "approve", summary: "Fine.", findings: [], next_steps: [] }, parseError: null },
+    { reviewLabel: "Adversarial Review", targetLabel: "working tree diff", sandbox: { requested: "read-only", applied: null } }
+  );
+  assert.match(rendered, /Note: whether the `read-only` sandbox was enforced for this run could not be confirmed/);
+  assert.match(rendered, /Verdict: approve/);
+});
+
+/**
+ * The log carries no session id, so attribution is by append order. When the
+ * records a run appended disagree — a concurrent run in the same tree, or a
+ * forged entry — the outcome is unconfirmed, never resolved either way.
+ */
+test("sandbox events that disagree during a run are reported as unconfirmed", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-sandbox-ambiguous");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.sandbox.applied, null);
+  assert.match(payload.sandbox.detail, /disagree, so the outcome is ambiguous/);
+
+  const rendered = run("node", [SCRIPT, "adversarial-review"], { cwd, env });
+  assert.match(rendered.stdout, /Note: whether the `read-only` sandbox was enforced for this run could not be confirmed .*ambiguous/);
+});
+
+/** A fingerprint that could not be completed must read as unverified, not clean. */
+test("a review whose tree could not be verified says so", async () => {
+  const { renderReviewResult } = await import("../plugins/grok/scripts/lib/render.mjs");
+  const rendered = renderReviewResult(
+    { parsed: { verdict: "approve", summary: "Fine.", findings: [], next_steps: [] }, parseError: null },
+    { reviewLabel: "Adversarial Review", targetLabel: "working tree diff", workingTreeChanges: [], workingTreeUnverified: "git hash-object failed: boom" }
+  );
+  assert.match(rendered, /Warning: the working tree could not be verified after this review \(git hash-object failed: boom\)/);
+});
+
+/**
+ * The payload promises `review-output.schema.json`. An unconstrained answer
+ * that drops a required field has to go through the schema-constrained
+ * re-emit, not be handed on with the gap normalized away.
+ */
+test("a finding missing schema fields is re-emitted under the schema", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-missing-fields");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.parseError, null);
+  assert.equal(payload.result.findings[0].severity, "high");
+  assert.equal(payload.result.findings[0].confidence, 0.9);
+
+  const [, reemit] = grokRuns(binDir);
+  assert.ok(reemit.includes("--json-schema"), "the missing fields are restored by the schema-constrained re-emit");
+});
+
+/**
+ * The tripwire behind the sandbox: the tree is fingerprinted before and after
+ * a review, so a run that wrote into it is caught whatever the sandbox did.
+ */
+test("a review that modified the working tree is flagged", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-writes-file");
+  const env = buildEnv(binDir);
+  const pluginData = makeTempDir("plugin-data-");
+  env.CLAUDE_PLUGIN_DATA = pluginData;
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(payload.workingTreeChanges, ["leaked.txt"]);
+
+  const rendered = run("node", [SCRIPT, "adversarial-review"], { cwd, env });
+  assert.match(rendered.stdout, /Warning: the working tree changed while this review ran \(1 path: leaked\.txt\)/);
+
+  const stateRoot = path.join(pluginData, "state");
+  const stateDir = path.join(stateRoot, fs.readdirSync(stateRoot)[0]);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.ok(
+    state.jobs.every((job) => /^Warning: the working tree changed during the review\./.test(job.summary)),
+    "the /grok:status line must carry the warning too"
+  );
+});
+
+/**
+ * Nothing validates the unconstrained answer before the companion sees it, so
+ * an object that parses but is not a review must go to the schema-constrained
+ * re-emit instead of being rendered as one.
+ */
+test("a well-formed object that is not a review is re-emitted under the schema", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-wrong-shape");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+
+  assert.equal(payload.parseError, null);
+  assert.equal(payload.result.findings.length, 1);
+
+  const [, reemit] = grokRuns(binDir);
+  assert.ok(reemit.includes("--json-schema"), "the shape fix is the schema-constrained re-emit");
+});
+
 test("adversarial review asks grok to re-emit when nothing parses", () => {
   const binDir = makeTempDir();
   installFakeGrok(binDir, "review-reemit");
@@ -315,8 +668,48 @@ test("adversarial review asks grok to re-emit when nothing parses", () => {
   assert.equal(payload.parseError, null, "the resumed re-emit run should have produced a usable object");
   assert.equal(payload.result.findings.length, 1);
 
-  const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-grok-state.json"), "utf8"));
-  assert.ok(state.lastArgs.includes("--resume"), "the retry must resume the same grok session");
+  const [investigation, retry] = grokRuns(binDir);
+  assert.ok(retry.includes("--resume"), "the retry must resume the same grok session");
+  // The re-emit needs no tools, so it is the one turn where the schema flag is
+  // safe — and the guarantee of shape is worth having there.
+  assert.ok(!investigation.includes("--json-schema"), "the investigation must not be schema-constrained");
+  assert.ok(retry.includes("--json-schema"), "the tool-free re-emit is where the schema is enforced");
+  assert.equal(retry[retry.indexOf("--max-turns") + 1], "1");
+});
+
+/**
+ * The failure that made every adversarial review come back empty: Grok 1.0.13
+ * applies `--json-schema` to every assistant message, and under it grok-4.6
+ * never calls a tool. It reasons about inspecting the diff, then its message is
+ * forced into the schema shape and the turn ends with "review in progress" —
+ * and a resumed turn under the same flag repeats the stub, so the restate retry
+ * failed the same way. The investigation has to run unconstrained, with the
+ * schema carried in the prompt.
+ */
+test("the investigative review turn runs unconstrained so grok can inspect the diff", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-schema-blind");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+
+  assert.equal(payload.parseError, null);
+  assert.equal(payload.result.findings.length, 1);
+
+  const runs = grokRuns(binDir);
+  assert.equal(runs.length, 1, "a review grok could finish must not need a retry");
+  assert.ok(!runs[0].includes("--json-schema"), "the investigative turn must not be schema-constrained");
+  // Without --verbatim the CLI truncates a prompt over ~32 KB to its first 20 KB
+  // and offloads the rest to a file — which an inline diff regularly exceeds.
+  assert.ok(runs[0].includes("--verbatim"), "the review prompt must reach grok whole");
+
+  const prompt = runs[0][runs[0].indexOf("-p") + 1];
+  assert.match(prompt, /<output_schema>/, "the schema has to travel in the prompt instead");
+  assert.match(prompt, /"needs-attention"/, "the prompt must carry the schema's verdict values");
 });
 
 test("task run returns final message and session id", () => {
@@ -380,8 +773,8 @@ test("read-only task requests the read-only sandbox profile", () => {
 
 function seededTransferPrompt(binDir) {
   const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-grok-state.json"), "utf8"));
-  const index = state.lastArgs.indexOf("-p");
-  return index === -1 ? "" : state.lastArgs[index + 1];
+  // A transfer seed is far too long for argv, so it arrives as a file.
+  return state.lastPrompt ?? "";
 }
 
 function writeTranscript(dir, turns) {
@@ -664,7 +1057,7 @@ test("native branch review pins the commit range and file list in its prompt", (
 
   const mergeBase = run("git", ["merge-base", "HEAD", "origin/main"], { cwd }).stdout.trim();
   const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-grok-state.json"), "utf8"));
-  const prompt = state.lastArgs[state.lastArgs.indexOf("-p") + 1];
+  const prompt = state.lastPrompt;
 
   assert.match(prompt, new RegExp(`git diff ${mergeBase}\\.\\.HEAD`), "the exact range must be named");
   assert.match(prompt, /Only these 1 file\(s\) are in scope: feature\.js/);
