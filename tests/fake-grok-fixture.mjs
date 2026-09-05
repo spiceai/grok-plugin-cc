@@ -41,6 +41,9 @@ function parseArgs(argv) {
     const arg = argv[i];
     if (arg === "-p" || arg === "--single") {
       out.flags.prompt = argv[++i];
+    } else if (arg === "--prompt-file") {
+      out.flags.prompt = fs.readFileSync(argv[++i], "utf8");
+      out.flags.promptFile = true;
     } else if (arg === "--cwd") {
       out.flags.cwd = argv[++i];
     } else if (arg === "-m" || arg === "--model") {
@@ -80,6 +83,14 @@ const parsed = parseArgs(argv);
 const state = loadState();
 state.runs += 1;
 state.lastArgs = argv;
+// The prompt as received, whether it came on argv or through --prompt-file
+// (which the companion deletes once the run ends).
+state.lastPrompt = parsed.flags.prompt;
+// Every headless prompt run, in order. The companion probes grok --version
+// before each run, and those probes are not turns.
+if (parsed.flags.prompt !== undefined) {
+  state.argsHistory = [...(state.argsHistory || []), argv];
+}
 saveState(state);
 
 if (parsed.flags.version || argv.includes("version")) {
@@ -115,9 +126,11 @@ if (isTransfer) {
 } else if (isStopGate) {
   finalText = BEHAVIOR === "stop-block" ? "BLOCK: leftover debug assert in main.ts" : "ALLOW: no blocking issues in the last turn";
 } else if (isReview || BEHAVIOR === "review-ok") {
-  if (parsed.flags.jsonSchema) {
+  // The companion carries the schema in the prompt for the investigative turn
+  // and pins --json-schema only on a re-emit; either one asks for JSON.
+  if (parsed.flags.jsonSchema || /<output_schema>/.test(prompt)) {
     finalText = JSON.stringify({
-      verdict: "needs changes",
+      verdict: "needs-attention",
       summary: "Found one material issue in the change set.",
       findings: [
         {
@@ -127,6 +140,7 @@ if (isTransfer) {
           file: "src/main.ts",
           line_start: 12,
           line_end: 18,
+          confidence: 0.9,
           recommendation: "Guard against null input before parsing."
         }
       ],
@@ -323,6 +337,70 @@ if (BEHAVIOR === "hang") {
 if (BEHAVIOR === "slow-review") {
   emit({ type: "thought", data: "Working through the diff." });
   sleepSync(Number(process.env.FAKE_GROK_SLEEP_MS || 1200));
+}
+
+if (BEHAVIOR === "review-schema-blind") {
+  // Grok 1.0.13 with grok-4.6, as observed: a turn run under --json-schema
+  // never calls a tool. The model reasons about inspecting the diff, then its
+  // message is forced into the schema shape and the turn ends with a stub — on
+  // every turn, a resumed one included, so no retry under the flag can rescue
+  // it. Left unconstrained, the same prompt inspects the diff and answers.
+  if (parsed.flags.jsonSchema) {
+    emit({ type: "thought", data: "Let me start by inspecting the git diff as instructed." });
+    emit({
+      type: "text",
+      data: JSON.stringify({
+        verdict: "needs-attention",
+        summary: "Review in progress; inspecting the working-tree diff before emitting findings.",
+        findings: [],
+        next_steps: []
+      })
+    });
+  } else {
+    emit({ type: "text", data: "Inspecting the diff first." });
+    emit({ type: "tool_call", toolCallId: "c1", title: "Shell", kind: "execute", status: "in_progress", toolName: "run_terminal_command", rawInput: { command: "git diff" } });
+    emit({ type: "tool_call_update", toolCallId: "c1", status: "completed", toolName: "run_terminal_command" });
+    emit({ type: "text", data: JSON.stringify(REVIEW_OBJECT) });
+  }
+  emit({ type: "end", stopReason: "end_turn", sessionId, requestId: "req-fake" });
+  state.sessions.push(sessionId);
+  saveState(state);
+  process.exit(0);
+}
+
+const BLIND_APPROVAL = { verdict: "approve", summary: "Nothing here looks risky.", findings: [], next_steps: [] };
+
+if (BEHAVIOR === "review-blind-approve" || BEHAVIOR === "review-blind-always") {
+  // An approval written from the file list: no tool call, then a clean bill.
+  // "blind-approve" looks properly once sent back; "blind-always" never does.
+  if (parsed.flags.resume && BEHAVIOR === "review-blind-approve") {
+    emit({ type: "tool_call", toolCallId: "c1", title: "Shell", kind: "execute", status: "in_progress", toolName: "run_terminal_command", rawInput: { command: "git diff" } });
+    emit({ type: "tool_call_update", toolCallId: "c1", status: "completed", toolName: "run_terminal_command" });
+    emit({ type: "text", data: JSON.stringify(REVIEW_OBJECT) });
+  } else {
+    emit({ type: "text", data: JSON.stringify(BLIND_APPROVAL) });
+  }
+  emit({ type: "end", stopReason: "end_turn", sessionId, requestId: "req-fake" });
+  state.sessions.push(sessionId);
+  saveState(state);
+  process.exit(0);
+}
+
+if (BEHAVIOR === "review-wrong-shape") {
+  // Unconstrained, the model answers with an object that is not a review; the
+  // schema-constrained re-emit is what fixes the shape.
+  if (parsed.flags.jsonSchema) {
+    emit({ type: "text", data: JSON.stringify(REVIEW_OBJECT) });
+    emit({ type: "end", stopReason: "end_turn", sessionId, requestId: "req-fake", structuredOutput: REVIEW_OBJECT });
+  } else {
+    emit({ type: "tool_call", toolCallId: "c1", title: "Read", kind: "read", status: "in_progress", toolName: "read_file", rawInput: { path: "src/main.ts" } });
+    emit({ type: "tool_call_update", toolCallId: "c1", status: "completed", toolName: "read_file" });
+    emit({ type: "text", data: JSON.stringify({ notes: "Looked at the parser; the null path is unguarded.", verdict: "needs changes" }) });
+    emit({ type: "end", stopReason: "end_turn", sessionId, requestId: "req-fake" });
+  }
+  state.sessions.push(sessionId);
+  saveState(state);
+  process.exit(0);
 }
 
 if (BEHAVIOR === "review-reemit") {

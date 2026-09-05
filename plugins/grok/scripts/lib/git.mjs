@@ -7,6 +7,11 @@ import { formatCommandFailure, runCommand, runCommandChecked } from "./process.m
 const MAX_UNTRACKED_BYTES = 24 * 1024;
 const DEFAULT_INLINE_DIFF_MAX_FILES = 2;
 const DEFAULT_INLINE_DIFF_MAX_BYTES = 256 * 1024;
+// Lightweight context still inlines untracked files — they are in no diff — but
+// only up to this much in total. The prompt reaches Grok whole, and a tree with
+// dozens of untracked files (generated reports, runtime workspaces) otherwise
+// inlines hundreds of kilobytes the model can read on demand instead.
+const DEFAULT_LIGHTWEIGHT_UNTRACKED_MAX_BYTES = 64 * 1024;
 
 // Git is directly executable on Windows. Repository-derived arguments must never pass through a shell.
 function git(cwd, args, options = {}) {
@@ -33,6 +38,14 @@ function normalizeMaxInlineDiffBytes(value) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 0) {
     return DEFAULT_INLINE_DIFF_MAX_BYTES;
+  }
+  return Math.floor(parsed);
+}
+
+function normalizeMaxUntrackedInlineBytes(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return DEFAULT_LIGHTWEIGHT_UNTRACKED_MAX_BYTES;
   }
   return Math.floor(parsed);
 }
@@ -277,32 +290,81 @@ function formatSection(title, body) {
   return [`## ${title}`, "", body.trim() ? body.trim() : "(none)", ""].join("\n");
 }
 
-function formatUntrackedFile(cwd, relativePath) {
+/**
+ * @returns {{ skipped: string } | { size: number, text: string }}
+ */
+function inspectUntrackedFile(cwd, relativePath) {
   const absolutePath = path.join(cwd, relativePath);
   let stat;
   try {
     stat = fs.statSync(absolutePath);
   } catch {
-    return `### ${relativePath}\n(skipped: broken symlink or unreadable file)`;
+    return { skipped: "broken symlink or unreadable file" };
   }
   if (stat.isDirectory()) {
-    return `### ${relativePath}\n(skipped: directory)`;
+    return { skipped: "directory" };
   }
   if (stat.size > MAX_UNTRACKED_BYTES) {
-    return `### ${relativePath}\n(skipped: ${stat.size} bytes exceeds ${MAX_UNTRACKED_BYTES} byte limit)`;
+    return { skipped: `${stat.size} bytes exceeds ${MAX_UNTRACKED_BYTES} byte limit`, oversized: true };
   }
 
   let buffer;
   try {
     buffer = fs.readFileSync(absolutePath);
   } catch {
-    return `### ${relativePath}\n(skipped: broken symlink or unreadable file)`;
+    return { skipped: "broken symlink or unreadable file" };
   }
   if (!isProbablyText(buffer)) {
-    return `### ${relativePath}\n(skipped: binary file)`;
+    return { skipped: "binary file" };
   }
 
-  return [`### ${relativePath}`, "```", buffer.toString("utf8").trimEnd(), "```"].join("\n");
+  return { size: buffer.length, text: buffer.toString("utf8").trimEnd() };
+}
+
+function formatUntrackedFileBlock(relativePath, file) {
+  if (file.skipped) {
+    return `### ${relativePath}\n(skipped: ${file.skipped})`;
+  }
+  return [`### ${relativePath}`, "```", file.text, "```"].join("\n");
+}
+
+/**
+ * Inline untracked files until `budgetBytes` is spent, then list the rest with
+ * their size for the model to read with its tools. Skipped entries (directories,
+ * binaries, oversized files) cost nothing and are always noted.
+ *
+ * `omitted` counts the text files the model has to read itself — oversized or
+ * past the budget — so the caller knows whether the prompt carries the whole
+ * change or Grok must go and look.
+ */
+function renderUntrackedFiles(cwd, files, budgetBytes) {
+  let remaining = budgetBytes;
+  let inlined = 0;
+  let deferred = 0;
+  let omitted = 0;
+  const blocks = files.map((relativePath) => {
+    const file = inspectUntrackedFile(cwd, relativePath);
+    if (file.skipped) {
+      if (file.oversized) {
+        omitted += 1;
+      }
+      return formatUntrackedFileBlock(relativePath, file);
+    }
+    if (file.size > remaining) {
+      deferred += 1;
+      omitted += 1;
+      return `### ${relativePath}\n(${file.size} bytes; not inlined — read it with your file tools)`;
+    }
+    remaining -= file.size;
+    inlined += 1;
+    return formatUntrackedFileBlock(relativePath, file);
+  });
+  if (deferred > 0) {
+    blocks.unshift(
+      `${inlined} of ${inlined + deferred} untracked text file(s) are inlined below, within a ${budgetBytes} byte budget. The rest are listed with their size only: read each one with your file tools before judging it.`
+    );
+  }
+  return { body: blocks.join("\n\n"), omitted };
 }
 
 function collectWorkingTreeContext(cwd, state, options = {}) {
@@ -311,34 +373,44 @@ function collectWorkingTreeContext(cwd, state, options = {}) {
   const changedFiles = listUniqueFiles(state.staged, state.unstaged, state.untracked);
 
   let parts;
+  // Whether the prompt carries the whole change. When it does not, a review
+  // that never called a tool was written from the file list.
+  let inlinedEverything;
   if (includeDiff) {
     const stagedDiff = gitChecked(cwd, ["diff", "--cached", "--binary", "--no-ext-diff", "--submodule=diff"]).stdout;
     const unstagedDiff = gitChecked(cwd, ["diff", "--binary", "--no-ext-diff", "--submodule=diff"]).stdout;
-    const untrackedBody = state.untracked.map((file) => formatUntrackedFile(cwd, file)).join("\n\n");
+    const untracked = renderUntrackedFiles(cwd, state.untracked, Infinity);
     parts = [
       formatSection("Git Status", status),
       formatSection("Staged Diff", stagedDiff),
       formatSection("Unstaged Diff", unstagedDiff),
-      formatSection("Untracked Files", untrackedBody)
+      formatSection("Untracked Files", untracked.body)
     ];
+    inlinedEverything = untracked.omitted === 0;
   } else {
     const stagedStat = gitChecked(cwd, ["diff", "--shortstat", "--cached"]).stdout.trim();
     const unstagedStat = gitChecked(cwd, ["diff", "--shortstat"]).stdout.trim();
-    const untrackedBody = state.untracked.map((file) => formatUntrackedFile(cwd, file)).join("\n\n");
+    const untracked = renderUntrackedFiles(
+      cwd,
+      state.untracked,
+      normalizeMaxUntrackedInlineBytes(options.maxUntrackedInlineBytes)
+    );
     parts = [
       formatSection("Git Status", status),
       formatSection("Staged Diff Stat", stagedStat),
       formatSection("Unstaged Diff Stat", unstagedStat),
       formatSection("Changed Files", changedFiles.join("\n")),
-      formatSection("Untracked Files", untrackedBody)
+      formatSection("Untracked Files", untracked.body)
     ];
+    inlinedEverything = state.staged.length === 0 && state.unstaged.length === 0 && untracked.omitted === 0;
   }
 
   return {
     mode: "working-tree",
     summary: `Reviewing ${state.staged.length} staged, ${state.unstaged.length} unstaged, and ${state.untracked.length} untracked file(s).`,
     content: parts.join("\n"),
-    changedFiles
+    changedFiles,
+    inlinedEverything
   };
 }
 
@@ -368,7 +440,8 @@ function collectBranchContext(cwd, baseRef, options = {}) {
           formatSection("Changed Files", changedFiles.join("\n"))
         ].join("\n"),
     changedFiles,
-    comparison
+    comparison,
+    inlinedEverything: includeDiff
   };
 }
 
@@ -420,7 +493,7 @@ function buildAdversarialCollectionGuidance(options = {}) {
       "Scope is pinned to the uncommitted working tree: staged changes, unstaged changes, and untracked files.",
       includeDiff
         ? "The diff below is the complete contents of that scope."
-        : "Inspect it with `git diff --cached`, `git diff`, and the untracked files listed below. Do not review committed history."
+        : "Inspect it with `git diff --cached`, `git diff`, and the untracked files listed below. Untracked files appear in no diff: where one is listed without its contents, read it with your file tools. Do not review committed history."
     );
   }
 
@@ -455,7 +528,10 @@ export function collectReviewContext(cwd, target, options = {}) {
       options.includeDiff ??
       (listUniqueFiles(state.staged, state.unstaged, state.untracked).length <= maxInlineFiles &&
         diffBytes <= maxInlineDiffBytes);
-    details = collectWorkingTreeContext(repoRoot, state, { includeDiff });
+    details = collectWorkingTreeContext(repoRoot, state, {
+      includeDiff,
+      maxUntrackedInlineBytes: options.maxUntrackedInlineBytes
+    });
   } else {
     const comparison = buildBranchComparison(repoRoot, target.baseRef);
     const fileCount = gitChecked(repoRoot, ["diff", "--name-only", comparison.commitRange]).stdout.trim().split("\n").filter(Boolean).length;

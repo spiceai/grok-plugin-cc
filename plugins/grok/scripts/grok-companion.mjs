@@ -61,7 +61,8 @@ import {
   renderJobStatusReport,
   renderSetupReport,
   renderStatusReport,
-  renderTaskResult
+  renderTaskResult,
+  validateReviewResultShape
 } from "./lib/render.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -241,13 +242,16 @@ async function handleSetup(argv) {
   outputResult(options.json ? finalReport : renderSetupReport(finalReport), options.json);
 }
 
-function buildAdversarialReviewPrompt(context, focusText) {
+function buildAdversarialReviewPrompt(context, focusText, outputSchema) {
   const template = loadPromptTemplate(ROOT_DIR, "adversarial-review");
   return interpolateTemplate(template, {
     REVIEW_KIND: "Adversarial Review",
     TARGET_LABEL: context.target.label,
     USER_FOCUS: focusText || "No extra focus provided.",
     REVIEW_COLLECTION_GUIDANCE: context.collectionGuidance,
+    // The schema travels in the prompt rather than as `--json-schema`; see the
+    // note where the review turn is launched.
+    OUTPUT_SCHEMA: JSON.stringify(outputSchema, null, 2),
     REVIEW_INPUT: context.content
   });
 }
@@ -268,13 +272,65 @@ const REVIEW_REEMIT_PROMPT = [
 
 // Re-emitting is the wrong ask when the previous object parsed perfectly and
 // simply said nothing; repeating "emit valid JSON" invites the same stub back.
+// This turn runs with the tools available, because an unfinished review usually
+// means the change was never looked at.
 const REVIEW_RESTATE_PROMPT = [
-  "Your previous answer was valid JSON but was not a review: it was a placeholder or a description of work still in progress.",
-  "Emit the finished review now as exactly one JSON object matching the schema.",
+  "Your previous answer was not a finished review: it was a placeholder, a description of work still in progress, or a verdict given without inspecting the change.",
+  "If you have not yet inspected the change, do that now with your read-only tools: run git diff for the pinned scope, and read any listed file whose contents were not provided.",
+  "Then emit the finished review as exactly one JSON object matching the schema.",
   "The summary must be your actual assessment of the change, not a placeholder token and not a description of what you are about to do.",
   "Every concern you have must appear as a finding. Use verdict `needs-attention` only when you list at least one finding; if the change is genuinely clean, use `approve` and say why in the summary.",
-  "Output only that object: no prose, no code fences, no progress updates, and no second copy."
+  "Make that object your final message: no code fences, no progress updates, and no second copy."
 ].join("\n");
+
+// A review of a change that was not in the prompt, reached without a single
+// tool call, was written from the file list. With the investigation no longer
+// run under `--json-schema`, nothing else stops that from reading as a clean
+// bill of health.
+const UNINSPECTED_REVIEW_REASON =
+  "Grok answered without inspecting the change: parts of it were not in the prompt and Grok called no tool, so the verdict cannot rest on the code. The run produced no assessment.";
+
+/**
+ * Whether a turn looked at the repository at all. Under the read-only profile
+ * every tool Grok has left is an inspection tool, so any call counts.
+ *
+ * This is a coarse gate on purpose: it catches the answer given from the file
+ * list, which is the failure that was shipping. It does not prove every file
+ * left out of the prompt was read — tool arguments take too many shapes (a
+ * shell `cat`, a file read, a grep) to pin each path reliably.
+ */
+function hasToolCalls(result) {
+  return Array.isArray(result?.events) && result.events.some((event) => event?.type === "tool_call");
+}
+
+/**
+ * Why a parsed object cannot be handed on as a review, or null.
+ *
+ * The investigation runs unconstrained, so nothing validated the object before
+ * it got here: this is the shape gate `--json-schema` used to be. A miss is a
+ * formatting problem, which the schema-constrained re-emit exists to fix.
+ */
+function findMalformedReviewReason(review, schema) {
+  const shapeError = validateReviewResultShape(review);
+  if (shapeError) {
+    return `Grok's JSON was not a review. ${shapeError}`;
+  }
+  const verdicts = schema?.properties?.verdict?.enum ?? [];
+  if (verdicts.length > 0 && !verdicts.includes(review.verdict)) {
+    return `Grok's JSON used the verdict ${JSON.stringify(review.verdict)}; the schema allows ${verdicts.map((verdict) => `\`${verdict}\``).join(" or ")}.`;
+  }
+  const incomplete = review.findings.findIndex(
+    (finding) =>
+      !finding ||
+      typeof finding !== "object" ||
+      Array.isArray(finding) ||
+      ["title", "body", "file"].some((field) => typeof finding[field] !== "string" || !finding[field].trim())
+  );
+  if (incomplete !== -1) {
+    return `Grok's JSON finding ${incomplete + 1} is missing its title, body, or file.`;
+  }
+  return null;
+}
 
 /** A parsed object is only useful as a review if it carries the review fields. */
 function looksLikeReviewResult(value) {
@@ -347,7 +403,12 @@ function findUnusableReviewReason(review) {
   return null;
 }
 
-function parseReviewOutput(result) {
+/**
+ * @param {{ schema?: object, requireInspection?: boolean }} [options]
+ *   `requireInspection`: the prompt did not carry the whole change and the
+ *   session has not called a tool, so any answer was given blind.
+ */
+function parseReviewOutput(result, options = {}) {
   const parsed = parseStructuredOutput(result.finalMessage, {
     status: result.status,
     structuredOutput: result.structuredOutput,
@@ -367,10 +428,19 @@ function parseReviewOutput(result) {
   }
 
   if (parsed.parsed) {
-    const unusableReason = findUnusableReviewReason(parsed.parsed);
+    // `next_steps` is not load-bearing: an answer cut off before it, or a model
+    // that skipped it, still carries the review. Everything else missing is a
+    // shape problem worth a re-emit.
+    const review = { next_steps: [], ...parsed.parsed };
+    const malformedReason = findMalformedReviewReason(review, options.schema);
+    if (malformedReason) {
+      return { ...parsed, parsed: null, parseError: malformedReason };
+    }
+    const unusableReason = findUnusableReviewReason(review) ?? (options.requireInspection ? UNINSPECTED_REVIEW_REASON : null);
     if (unusableReason) {
       return { ...parsed, parsed: null, parseError: unusableReason, unusableContent: true };
     }
+    return { ...parsed, parsed: review };
   }
 
   return parsed;
@@ -539,21 +609,58 @@ async function executeReviewRun(request) {
   }
 
   const context = collectReviewContext(request.cwd, target);
-  const prompt = buildAdversarialReviewPrompt(context, focusText);
   const schema = readOutputSchema(REVIEW_SCHEMA);
+  const prompt = buildAdversarialReviewPrompt(context, focusText, schema);
+  // The investigation runs without `--json-schema`. Grok applies that flag to
+  // every assistant message, and under it grok-4.6 never calls a tool: it
+  // reasons about inspecting the diff, then its message is forced into the
+  // schema shape and the turn ends with a "review in progress" stub — on every
+  // turn, so a resumed retry under the flag just repeats the stub. Every
+  // adversarial review failed this way. With the schema in the prompt instead,
+  // Grok can read the change and still answer in the requested shape; the flag
+  // is kept for the tool-free re-emit below, where a constrained answer is
+  // exactly what is wanted.
+  //
+  // `verbatim` keeps the prompt whole. Without it the CLI truncates anything
+  // over roughly 32 KB to its first 20 KB and offloads the rest to a file the
+  // model is told to read — which an inline diff regularly exceeds.
   let result = await runAppServerTurn(context.repoRoot, {
     prompt,
     model: request.model,
     sandbox: "read-only",
-    outputSchema: schema,
+    verbatim: true,
     onProgress: request.onProgress
   });
-  let parsed = parseReviewOutput(result);
+  const requireInspection = !context.inlinedEverything;
+  let inspected = hasToolCalls(result);
+  let parsed = parseReviewOutput(result, { schema, requireInspection: requireInspection && !inspected });
 
-  // Grok narrates between tool calls, and under a JSON schema that narration is
-  // itself JSON. Parsing already recovers the real answer from a run of drafts,
-  // but if even that fails the session is still warm and its context cached —
-  // one short "re-emit the JSON" turn is far cheaper than losing the review.
+  // A stub, or an answer given without looking at a change that was not in the
+  // prompt, means the investigation never finished. Ask again with the tools
+  // still available: a schema-constrained turn cannot inspect anything (see
+  // above), so it would only repeat the stub — which is exactly what the old
+  // restate retry did.
+  if ((parsed.unusableContent || (requireInspection && !inspected)) && result.threadId) {
+    request.onProgress?.("Grok's answer was not a finished review. Asking it to inspect the change and restate its assessment.");
+    const restated = await runAppServerTurn(context.repoRoot, {
+      prompt: REVIEW_RESTATE_PROMPT,
+      resumeThreadId: result.threadId,
+      model: request.model,
+      sandbox: "read-only",
+      onProgress: request.onProgress
+    });
+    inspected = inspected || hasToolCalls(restated);
+    result = { ...restated, reasoningSummary: [...result.reasoningSummary, ...restated.reasoningSummary] };
+    parsed = parseReviewOutput(result, { schema, requireInspection: requireInspection && !inspected });
+  }
+
+  // Grok narrates between tool calls, so the answer can arrive wrapped in prose,
+  // fenced, trailing an earlier draft, or missing a field. Parsing already
+  // recovers the object from most of that, but if it still cannot be read the
+  // session is warm and holds the findings — one short "re-emit the JSON" turn
+  // is far cheaper than losing the review. That turn needs no tools, so it is
+  // the one place `--json-schema` is safe: it guarantees the shape without
+  // costing the investigation.
   //
   // A salvaged object counts as "still needs the retry". Closing the delimiters
   // of a half-written answer produces something that parses but was never
@@ -562,16 +669,14 @@ async function executeReviewRun(request) {
   // possible output for a review tool. Asking Grok to restate its answer costs
   // one cheap turn and yields something it actually said, so the salvage is only
   // kept when the retry cannot do better.
-  if ((!parsed.parsed || parsed.recovered) && result.threadId) {
+  if (!parsed.unusableContent && (!parsed.parsed || parsed.recovered) && result.threadId) {
     request.onProgress?.(
-      parsed.unusableContent
-        ? "Grok returned a placeholder instead of a review. Asking it to restate its actual assessment."
-        : parsed.recovered
-          ? "Grok's JSON was incomplete and had to be repaired. Asking it to restate the review."
-          : "Grok returned unusable JSON. Asking it to re-emit the final object."
+      parsed.recovered
+        ? "Grok's JSON was incomplete and had to be repaired. Asking it to restate the review."
+        : "Grok returned unusable JSON. Asking it to re-emit the final object."
     );
     const retry = await runAppServerTurn(context.repoRoot, {
-      prompt: parsed.unusableContent ? REVIEW_RESTATE_PROMPT : REVIEW_REEMIT_PROMPT,
+      prompt: REVIEW_REEMIT_PROMPT,
       resumeThreadId: result.threadId,
       model: request.model,
       sandbox: "read-only",
@@ -579,7 +684,7 @@ async function executeReviewRun(request) {
       maxTurns: 1,
       onProgress: request.onProgress
     });
-    const retryParsed = parseReviewOutput(retry);
+    const retryParsed = parseReviewOutput(retry, { schema, requireInspection: requireInspection && !inspected });
     // Take the retry when it is a clean parse. When it also had to be salvaged
     // it is no more trustworthy than what we already had, so it only wins if the
     // first attempt produced nothing usable at all.

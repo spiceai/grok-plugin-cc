@@ -113,6 +113,7 @@ test("collectReviewContext keeps inline diffs for tiny adversarial reviews", () 
   assert.equal(context.fileCount, 1);
   assert.match(context.collectionGuidance, /primary evidence/i);
   assert.match(context.content, /INLINE_MARKER/);
+  assert.equal(context.inlinedEverything, true, "the prompt carries the whole change");
 });
 
 test("collectReviewContext skips untracked directories in working tree review", () => {
@@ -169,6 +170,7 @@ test("collectReviewContext falls back to lightweight context for larger adversar
   assert.match(context.collectionGuidance, /read-only git commands/i);
   assert.doesNotMatch(context.content, /SELF_COLLECT_MARKER_[ABC]/);
   assert.match(context.content, /## Changed Files/);
+  assert.equal(context.inlinedEverything, false, "grok has to go and read the diff");
 });
 
 test("collectReviewContext falls back to lightweight context for oversized single-file diffs", () => {
@@ -209,6 +211,42 @@ test("collectReviewContext keeps untracked file content in lightweight working t
   assert.doesNotMatch(context.content, /TRACKED_MARKER_[AB]/);
   assert.match(context.content, /## Untracked Files/);
   assert.match(context.content, /UNTRACKED_RISK_MARKER/);
+});
+
+/**
+ * Lightweight context has always carried untracked file contents, since they
+ * are in no diff — but with no ceiling. A tree with dozens of untracked files
+ * (runtime workspaces, generated reports) put several hundred kilobytes into
+ * every review prompt. Past the budget, files are listed by size for Grok to
+ * read with its tools.
+ */
+test("collectReviewContext bounds the untracked content it inlines in lightweight mode", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  for (const name of ["a.js", "b.js", "c.js"]) {
+    fs.writeFileSync(path.join(cwd, name), `export const value = "${name}-v1";\n`);
+  }
+  run("git", ["add", "a.js", "b.js", "c.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  for (const name of ["a.js", "b.js", "c.js"]) {
+    fs.writeFileSync(path.join(cwd, name), `export const value = "${name}-v2";\n`);
+  }
+  for (let index = 0; index < 6; index += 1) {
+    fs.writeFileSync(path.join(cwd, `gen-${index}.txt`), `UNTRACKED_MARKER_${index}\n${"x".repeat(2000)}\n`);
+  }
+
+  const target = resolveReviewTarget(cwd, {});
+  const context = collectReviewContext(cwd, target, { maxUntrackedInlineBytes: 5000 });
+
+  assert.equal(context.inputMode, "self-collect");
+  assert.match(context.content, /UNTRACKED_MARKER_0/);
+  assert.match(context.content, /UNTRACKED_MARKER_1/);
+  assert.doesNotMatch(context.content, /UNTRACKED_MARKER_[2-5]/, "files past the budget must not be inlined");
+  assert.match(context.content, /### gen-2\.txt\n\(\d+ bytes; not inlined/);
+  assert.match(context.content, /2 of 6 untracked text file\(s\) are inlined/);
+  assert.match(context.collectionGuidance, /read it with your file tools/);
+  assert.ok(Buffer.byteLength(context.content, "utf8") < 8000, "the prompt must stay close to the budget");
+  assert.equal(context.inlinedEverything, false);
 });
 
 /**

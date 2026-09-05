@@ -50,9 +50,7 @@ function grokArgv(binDir) {
 }
 
 function grokPrompt(binDir) {
-  const argv = grokArgv(binDir);
-  const index = argv.indexOf("-p");
-  return index === -1 ? "" : argv[index + 1];
+  return JSON.parse(fs.readFileSync(path.join(binDir, "fake-grok-state.json"), "utf8")).lastPrompt ?? "";
 }
 
 function sleep(ms) {

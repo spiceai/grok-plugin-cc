@@ -24,6 +24,10 @@ const TRANSFER_TAIL_INITIAL_BYTES = 1024 * 1024;
 const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current session state. Pick the next highest-value step and follow through until the task is resolved.";
 const DEFAULT_GROK_BIN = "grok";
+// Windows caps the whole command line at 32,767 characters, and an inline
+// review diff alone can run to 256 KB. Past this length the prompt goes over
+// as a file instead of on argv.
+const PROMPT_FILE_THRESHOLD_CHARS = 24_000;
 
 /**
  * @typedef {((update: string | { message: string, phase: string | null, threadId?: string | null, turnId?: string | null, stderrMessage?: string | null, logTitle?: string | null, logBody?: string | null }) => void)} ProgressReporter
@@ -271,7 +275,10 @@ export async function getGrokAuthStatus(cwd, options = {}) {
  * Build argv for a headless Grok invocation.
  */
 export function buildGrokHeadlessArgs(prompt, options = {}) {
-  const args = ["-p", prompt, "--output-format", options.outputFormat ?? "streaming-json"];
+  // A prompt file stands in for `-p` when the prompt is too long for argv.
+  const args = options.promptFile
+    ? ["--prompt-file", options.promptFile, "--output-format", options.outputFormat ?? "streaming-json"]
+    : ["-p", prompt, "--output-format", options.outputFormat ?? "streaming-json"];
 
   if (options.cwd) {
     args.push("--cwd", options.cwd);
@@ -305,6 +312,10 @@ export function buildGrokHeadlessArgs(prompt, options = {}) {
     args.push("--max-turns", String(options.maxTurns));
   }
   if (options.outputSchema) {
+    // Grok constrains every assistant message with this, not only the final
+    // one, and a constrained grok-4.6 turn does not call tools: it emits a
+    // schema-shaped stub and stops. Only pass a schema for turns that need no
+    // tools — a re-emit of an answer the session already holds.
     args.push("--json-schema", typeof options.outputSchema === "string" ? options.outputSchema : JSON.stringify(options.outputSchema));
   }
   if (options.rules) {
@@ -351,8 +362,28 @@ export async function runGrokTurn(cwd, options = {}) {
   }
 
   const bin = resolveGrokBinary(env);
+  // `--verbatim` still applies to a prompt file, so nothing is truncated.
+  let promptDir = null;
+  let promptFile = null;
+  if (prompt.length > PROMPT_FILE_THRESHOLD_CHARS) {
+    promptDir = fs.mkdtempSync(path.join(os.tmpdir(), "grok-companion-prompt-"));
+    promptFile = path.join(promptDir, "prompt.txt");
+    fs.writeFileSync(promptFile, prompt, "utf8");
+  }
+  const discardPromptFile = () => {
+    if (!promptDir) {
+      return;
+    }
+    try {
+      fs.rmSync(promptDir, { recursive: true, force: true });
+    } catch {
+      // Best effort; the CLI has already read it.
+    }
+    promptDir = null;
+  };
   const args = buildGrokHeadlessArgs(prompt, {
     cwd,
+    promptFile,
     model: options.model,
     effort: options.effort,
     resumeSessionId: options.resumeSessionId ?? options.resumeThreadId ?? null,
@@ -540,6 +571,7 @@ export async function runGrokTurn(cwd, options = {}) {
         return;
       }
       settled = true;
+      discardPromptFile();
       reject(error);
     });
 
@@ -552,6 +584,7 @@ export async function runGrokTurn(cwd, options = {}) {
         return;
       }
       settled = true;
+      discardPromptFile();
       // A run can end mid-thought or mid-message; keep those fragments.
       flushThought();
       closeSegment();
@@ -810,6 +843,9 @@ export async function importExternalAgentSession(cwd, options = {}) {
   const result = await runGrokTurn(cwd, {
     prompt,
     write: false,
+    // Without this the CLI keeps only the first 20 KB of the seed and offloads
+    // the rest to a file — most of the transferred context, silently.
+    verbatim: true,
     onProgress: options.onProgress,
     env: options.env,
     maxTurns: 2

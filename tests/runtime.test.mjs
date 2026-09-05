@@ -118,7 +118,7 @@ test("native review returns grok output for working tree changes", () => {
   assert.ok(payload.threadId);
 });
 
-test("adversarial review returns structured findings when schema is used", () => {
+test("adversarial review returns structured findings", () => {
   const binDir = makeTempDir();
   installFakeGrok(binDir, "review-ok");
   const env = buildEnv(binDir);
@@ -279,6 +279,12 @@ test("a placeholder review is restated rather than lost when grok can still answ
   assert.equal(payload.parseError, null);
   assert.notEqual(payload.result.summary, "PLACEHOLDER");
   assert.ok(payload.result.findings.length > 0);
+
+  // A stub means the change was never looked at, and a turn under
+  // `--json-schema` cannot look — so the restate has to run unconstrained.
+  const [, restate] = grokRuns(binDir);
+  assert.ok(restate.includes("--resume"));
+  assert.ok(!restate.includes("--json-schema"), "the restate must leave grok free to inspect");
 });
 
 /**
@@ -301,6 +307,139 @@ test("a grok process killed by a signal is reported as a failure, not a complete
   assert.match(result.error.message, /signal/i);
 });
 
+function grokRuns(binDir) {
+  return JSON.parse(fs.readFileSync(path.join(binDir, "fake-grok-state.json"), "utf8")).argsHistory;
+}
+
+/** Three modified files: over the inline threshold, so the diff is not in the prompt. */
+function prepareLightweightRepo() {
+  const cwd = makeTempDir("grok-repo-lite-");
+  initGitRepo(cwd);
+  for (const name of ["a.js", "b.js", "c.js"]) {
+    fs.writeFileSync(path.join(cwd, name), `export const value = "${name}-v1";\n`);
+  }
+  run("git", ["add", "."], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  for (const name of ["a.js", "b.js", "c.js"]) {
+    fs.writeFileSync(path.join(cwd, name), `export const value = "${name}-v2";\n`);
+  }
+  return cwd;
+}
+
+/**
+ * With the investigation unconstrained, an approval can be written from the
+ * file list alone. When the change was not in the prompt, a review that never
+ * called a tool has to be sent back to look — with its tools, not under the
+ * schema flag that stops it from looking.
+ */
+test("a review answered without inspecting an uninlined change is sent back to look", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-blind-approve");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareLightweightRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+
+  assert.equal(payload.parseError, null);
+  assert.equal(payload.result.verdict, "needs-attention", "the blind approval must not be the answer");
+  assert.equal(payload.result.findings.length, 1);
+
+  const [investigation, restate] = grokRuns(binDir);
+  assert.ok(!investigation.includes("--json-schema"));
+  assert.ok(restate.includes("--resume"), "the restate must continue the same session");
+  assert.ok(!restate.includes("--json-schema"), "a turn that still has to inspect must not be schema-constrained");
+  assert.ok(!restate.includes("--max-turns"), "a turn that still has to inspect must be free to call tools");
+});
+
+test("a review that never inspects an uninlined change is a failure, not an approval", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-blind-always");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareLightweightRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  const payload = JSON.parse(result.stdout);
+
+  assert.notEqual(result.status, 0, "an approval given blind must not exit clean");
+  assert.equal(payload.result, null);
+  assert.match(payload.parseError, /without inspecting/i);
+  assert.equal(grokRuns(binDir).length, 2, "one restate, then give up");
+});
+
+/** The guard must not fire when the prompt already carried the whole change. */
+test("an approval given from an inline diff needs no tool call", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-blind-always");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+
+  assert.equal(payload.parseError, null);
+  assert.equal(payload.result.verdict, "approve");
+  assert.equal(grokRuns(binDir).length, 1);
+});
+
+/**
+ * Windows caps a command line at 32,767 characters, and an inline review diff
+ * alone can run to 256 KB — a prompt that size on argv fails to spawn before
+ * Grok ever sees it. Past a threshold the prompt is handed over as a file.
+ */
+test("a review prompt too long for argv is handed to grok as a file", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-ok");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+  // One tracked change plus one ~21 KB untracked file: still inline mode, and
+  // still under the per-file cap, but the prompt now exceeds what a Windows
+  // command line can carry.
+  fs.writeFileSync(path.join(cwd, "generated.txt"), `${"x".repeat(80)}\n`.repeat(260));
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.parseError, null);
+  assert.equal(payload.result.findings.length, 1);
+
+  const [investigation] = grokRuns(binDir);
+  assert.ok(!investigation.includes("-p"), "a prompt this long must not ride on argv");
+  const promptFile = investigation[investigation.indexOf("--prompt-file") + 1];
+  assert.ok(promptFile, "the prompt must be handed over as a file");
+  assert.ok(investigation.includes("--verbatim"), "the file must still be sent whole");
+  assert.ok(!fs.existsSync(promptFile), "the prompt file must be cleaned up after the run");
+});
+
+/**
+ * Nothing validates the unconstrained answer before the companion sees it, so
+ * an object that parses but is not a review must go to the schema-constrained
+ * re-emit instead of being rendered as one.
+ */
+test("a well-formed object that is not a review is re-emitted under the schema", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-wrong-shape");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+
+  assert.equal(payload.parseError, null);
+  assert.equal(payload.result.findings.length, 1);
+
+  const [, reemit] = grokRuns(binDir);
+  assert.ok(reemit.includes("--json-schema"), "the shape fix is the schema-constrained re-emit");
+});
+
 test("adversarial review asks grok to re-emit when nothing parses", () => {
   const binDir = makeTempDir();
   installFakeGrok(binDir, "review-reemit");
@@ -315,8 +454,48 @@ test("adversarial review asks grok to re-emit when nothing parses", () => {
   assert.equal(payload.parseError, null, "the resumed re-emit run should have produced a usable object");
   assert.equal(payload.result.findings.length, 1);
 
-  const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-grok-state.json"), "utf8"));
-  assert.ok(state.lastArgs.includes("--resume"), "the retry must resume the same grok session");
+  const [investigation, retry] = grokRuns(binDir);
+  assert.ok(retry.includes("--resume"), "the retry must resume the same grok session");
+  // The re-emit needs no tools, so it is the one turn where the schema flag is
+  // safe — and the guarantee of shape is worth having there.
+  assert.ok(!investigation.includes("--json-schema"), "the investigation must not be schema-constrained");
+  assert.ok(retry.includes("--json-schema"), "the tool-free re-emit is where the schema is enforced");
+  assert.equal(retry[retry.indexOf("--max-turns") + 1], "1");
+});
+
+/**
+ * The failure that made every adversarial review come back empty: Grok 1.0.13
+ * applies `--json-schema` to every assistant message, and under it grok-4.6
+ * never calls a tool. It reasons about inspecting the diff, then its message is
+ * forced into the schema shape and the turn ends with "review in progress" —
+ * and a resumed turn under the same flag repeats the stub, so the restate retry
+ * failed the same way. The investigation has to run unconstrained, with the
+ * schema carried in the prompt.
+ */
+test("the investigative review turn runs unconstrained so grok can inspect the diff", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-schema-blind");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+
+  assert.equal(payload.parseError, null);
+  assert.equal(payload.result.findings.length, 1);
+
+  const runs = grokRuns(binDir);
+  assert.equal(runs.length, 1, "a review grok could finish must not need a retry");
+  assert.ok(!runs[0].includes("--json-schema"), "the investigative turn must not be schema-constrained");
+  // Without --verbatim the CLI truncates a prompt over ~32 KB to its first 20 KB
+  // and offloads the rest to a file — which an inline diff regularly exceeds.
+  assert.ok(runs[0].includes("--verbatim"), "the review prompt must reach grok whole");
+
+  const prompt = runs[0][runs[0].indexOf("-p") + 1];
+  assert.match(prompt, /<output_schema>/, "the schema has to travel in the prompt instead");
+  assert.match(prompt, /"needs-attention"/, "the prompt must carry the schema's verdict values");
 });
 
 test("task run returns final message and session id", () => {
@@ -380,8 +559,8 @@ test("read-only task requests the read-only sandbox profile", () => {
 
 function seededTransferPrompt(binDir) {
   const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-grok-state.json"), "utf8"));
-  const index = state.lastArgs.indexOf("-p");
-  return index === -1 ? "" : state.lastArgs[index + 1];
+  // A transfer seed is far too long for argv, so it arrives as a file.
+  return state.lastPrompt ?? "";
 }
 
 function writeTranscript(dir, turns) {
@@ -664,7 +843,7 @@ test("native branch review pins the commit range and file list in its prompt", (
 
   const mergeBase = run("git", ["merge-base", "HEAD", "origin/main"], { cwd }).stdout.trim();
   const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-grok-state.json"), "utf8"));
-  const prompt = state.lastArgs[state.lastArgs.indexOf("-p") + 1];
+  const prompt = state.lastPrompt;
 
   assert.match(prompt, new RegExp(`git diff ${mergeBase}\\.\\.HEAD`), "the exact range must be named");
   assert.match(prompt, /Only these 1 file\(s\) are in scope: feature\.js/);
