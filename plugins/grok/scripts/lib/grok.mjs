@@ -28,11 +28,8 @@ const DEFAULT_GROK_BIN = "grok";
 // review diff alone can run to 256 KB. Past this length the prompt goes over
 // as a file instead of on argv.
 const PROMPT_FILE_THRESHOLD_CHARS = 24_000;
-// The sandbox event log is append-only across every session; only its tail
-// can concern a run that just finished.
-const SANDBOX_EVENTS_TAIL_BYTES = 256 * 1024;
-// Event timestamps come from the CLI's clock after ours took the start time.
-const SANDBOX_EVENT_SLACK_MS = 5_000;
+// A run appends a handful of sandbox events; this bounds a pathological one.
+const SANDBOX_EVENTS_MAX_BYTES = 16 * 1024 * 1024;
 
 /**
  * @typedef {((update: string | { message: string, phase: string | null, threadId?: string | null, turnId?: string | null, stderrMessage?: string | null, logTitle?: string | null, logBody?: string | null }) => void)} ProgressReporter
@@ -403,7 +400,8 @@ export async function runGrokTurn(cwd, options = {}) {
   });
 
   emitProgress(options.onProgress, options.resumeSessionId || options.resumeThreadId ? `Resuming Grok session ${options.resumeSessionId || options.resumeThreadId}.` : "Starting Grok headless run.", "starting");
-  const startedAt = Date.now();
+  // Only what this run appends to the sandbox event log is read back.
+  const sandboxLogStart = options.sandbox ? sandboxLogOffset(env) : 0;
 
   return new Promise((resolve, reject) => {
     const child = spawn(bin, args, {
@@ -609,7 +607,11 @@ export async function runGrokTurn(cwd, options = {}) {
       // `applied: null` means the log had nothing to say, not that the fence
       // was up.
       const sandbox = options.sandbox
-        ? { requested: String(options.sandbox), applied: null, ...(readSandboxOutcome(env, cwd, startedAt, Date.now()) ?? {}) }
+        ? {
+            requested: String(options.sandbox),
+            applied: null,
+            ...(readSandboxOutcome(env, cwd, { offset: sandboxLogStart, profile: options.sandbox }) ?? {})
+          }
         : null;
 
       resolve({
@@ -1138,40 +1140,71 @@ function canonicalPath(target) {
   }
 }
 
+function sandboxLogPath(env) {
+  return path.join(resolveGrokHome(env), "sandbox-events.jsonl");
+}
+
 /**
- * What the sandbox actually did for a run in `workspace` that started at
- * `sinceMs` and ended at `untilMs`.
+ * Where the sandbox event log ends right now. Taken before a run is spawned so
+ * that only what the run appends is read afterwards.
+ */
+export function sandboxLogOffset(env) {
+  try {
+    return fs.statSync(sandboxLogPath(env)).size;
+  } catch {
+    return 0;
+  }
+}
+
+function readRangeUtf8(sourcePath, start, length) {
+  const buffer = Buffer.alloc(length);
+  const fd = fs.openSync(sourcePath, "r");
+  try {
+    fs.readSync(fd, buffer, 0, length, start);
+  } finally {
+    fs.closeSync(fd);
+  }
+  return buffer.toString("utf8");
+}
+
+/**
+ * What the sandbox actually did for a run in `workspace`, from the events the
+ * log gained after `offset` — the log's size when the run was spawned.
  *
  * `--sandbox` is a request, not a guarantee: when the kernel policy cannot be
  * applied the CLI logs a warning and continues without enforcement, and
  * headless stderr is quiet by default, so the event log in $GROK_HOME is the
- * only record. Returns null when that log says nothing about this run (an
+ * only record. Returns null when the run appended nothing about itself (an
  * older CLI, or logging off) — absence of evidence, not enforcement.
  *
- * The log is shared by every session, and its events carry no session id. The
- * profile is applied at process startup, so of the events for this workspace
- * inside the run's window the earliest is this run's; a later one belongs to
- * whatever started next in the same tree. The log lives in $GROK_HOME, which
- * every profile leaves writable, so a run could in principle append to it;
- * the earliest-event rule means a forged entry cannot displace a genuine
- * startup one, and the working-tree fingerprint does not depend on the log at
- * all.
+ * The log is shared by every session and its events carry no session id, so
+ * attribution is by append order: the profile is applied at process startup,
+ * so the first event this run appended for its workspace and profile is its
+ * own. Anything appended later that disagrees — a concurrent run in the same
+ * tree, or a record forged by an unfenced run into a log every profile leaves
+ * writable — makes the outcome ambiguous, which is reported as unconfirmed
+ * rather than resolved either way. The working-tree fingerprint does not
+ * depend on the log at all.
  *
- * @returns {{ profile: string | null, applied: boolean, workspaceWritable: boolean, platform: string | null, detail: string | null } | null}
+ * @returns {{ profile: string | null, applied: boolean | null, workspaceWritable: boolean, platform: string | null, detail: string | null } | null}
  */
-export function readSandboxOutcome(env, workspace, sinceMs, untilMs = Date.now()) {
-  const logPath = path.join(resolveGrokHome(env), "sandbox-events.jsonl");
+export function readSandboxOutcome(env, workspace, options = {}) {
+  const offset = Number(options.offset) || 0;
+  const requestedProfile = options.profile ? String(options.profile) : null;
   let text;
   try {
+    const logPath = sandboxLogPath(env);
     const { size } = fs.statSync(logPath);
-    text = readTailUtf8(logPath, size, Math.min(size, SANDBOX_EVENTS_TAIL_BYTES));
+    if (size <= offset) {
+      return null;
+    }
+    text = readRangeUtf8(logPath, offset, Math.min(size - offset, SANDBOX_EVENTS_MAX_BYTES));
   } catch {
     return null;
   }
 
   const wanted = canonicalPath(workspace);
-  let chosen = null;
-  let chosenAt = Infinity;
+  const matches = [];
   for (const line of text.split(/\r?\n/)) {
     if (!line.trim()) {
       continue;
@@ -1180,7 +1213,7 @@ export function readSandboxOutcome(env, workspace, sinceMs, untilMs = Date.now()
     try {
       event = JSON.parse(line);
     } catch {
-      continue; // The tail window can open mid-record.
+      continue; // A record another process was mid-way through writing.
     }
     if (event.event_type !== "ProfileApplied" && event.event_type !== "ApplyFailed") {
       continue;
@@ -1188,20 +1221,28 @@ export function readSandboxOutcome(env, workspace, sinceMs, untilMs = Date.now()
     if (canonicalPath(event.workspace) !== wanted) {
       continue;
     }
-    const at = Date.parse(event.timestamp ?? "");
-    if (!Number.isFinite(at) || at < sinceMs - SANDBOX_EVENT_SLACK_MS || at > untilMs + SANDBOX_EVENT_SLACK_MS) {
+    if (requestedProfile && event.profile && String(event.profile) !== requestedProfile) {
       continue;
     }
-    if (at < chosenAt) {
-      chosen = event;
-      chosenAt = at;
-    }
+    matches.push(event);
   }
-  if (!chosen) {
+  if (matches.length === 0) {
     return null;
   }
 
-  const applied = chosen.event_type === "ProfileApplied" && chosen.enforced !== false;
+  const enforced = (event) => event.event_type === "ProfileApplied" && event.enforced !== false;
+  const chosen = matches[0];
+  if (matches.some((event) => enforced(event) !== enforced(chosen))) {
+    return {
+      profile: chosen.profile ?? requestedProfile,
+      applied: null,
+      workspaceWritable: false,
+      platform: chosen.platform ?? null,
+      detail: `${matches.length} sandbox events for this workspace were appended during the run and disagree, so the outcome is ambiguous`
+    };
+  }
+
+  const applied = enforced(chosen);
   // Enforced is not the same as covering the tree: `read-only` keeps the
   // system temp directories writable, so a checkout under /tmp is fenced by
   // nothing at the OS level even though the profile applied.

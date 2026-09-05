@@ -114,6 +114,11 @@ if (parsed.flags.sandbox && parsed.flags.prompt !== undefined) {
   const workspace = parsed.flags.cwd || process.cwd();
   if (BEHAVIOR === "review-sandbox-unapplied" || (BEHAVIOR === "review-sandbox-unapplied-first-turn" && !parsed.flags.resume)) {
     recordSandboxEvent("ApplyFailed", { error: "seatbelt unavailable in this environment" });
+  } else if (BEHAVIOR === "review-sandbox-ambiguous") {
+    // Two records this run appended disagree: whatever the reason, the
+    // outcome cannot be read either way.
+    recordSandboxEvent("ApplyFailed", { error: "seatbelt unavailable in this environment" });
+    recordSandboxEvent("ProfileApplied", { platform: "fake/none", enforced: true, restrict_network: true });
   } else if (BEHAVIOR === "review-sandbox-writable-workspace") {
     // Enforced, but the tree sits inside a path the profile keeps writable —
     // what a checkout under /tmp gets from the real read-only profile.
@@ -279,6 +284,23 @@ if (BEHAVIOR === "review-truncated") {
   process.exit(0);
 }
 
+if (BEHAVIOR === "review-truncated-approve-mid-finding") {
+  // Cut in the middle of a finding under an approving verdict. Dropping the
+  // half-written finding would leave an approval with none — a concern the
+  // cut erased, not an all-clear the model gave.
+  if (parsed.flags.resume) {
+    emit({ type: "text", data: JSON.stringify(REVIEW_OBJECT) });
+    emit({ type: "end", stopReason: "end_turn", sessionId, requestId: "req-fake" });
+  } else {
+    const serialized = JSON.stringify({ verdict: "approve", summary: "Looks fine overall.", findings: [REVIEW_OBJECT.findings[0]], next_steps: [] });
+    emit({ type: "text", data: serialized.slice(0, serialized.indexOf("assumes input") + 6) });
+    emit({ type: "end", stopReason: "max_tokens", sessionId, requestId: "req-fake" });
+  }
+  state.sessions.push(sessionId);
+  saveState(state);
+  process.exit(0);
+}
+
 if (BEHAVIOR === "review-truncated-allclear") {
   // Cut off before a single finding was written. Repair can only close the
   // empty array, which would read as a clean approval the model never gave.
@@ -416,7 +438,32 @@ if (BEHAVIOR === "review-schema-blind") {
 
 const BLIND_APPROVAL = { verdict: "approve", summary: "Nothing here looks risky.", findings: [], next_steps: [] };
 
-if (BEHAVIOR === "review-sandbox-unapplied" || BEHAVIOR === "review-writes-file" || BEHAVIOR === "review-sandbox-writable-workspace") {
+if (BEHAVIOR === "review-missing-fields") {
+  // Unconstrained, the model leaves out fields the schema requires; the
+  // schema-constrained re-emit is what restores them.
+  if (parsed.flags.jsonSchema) {
+    emit({ type: "text", data: JSON.stringify(REVIEW_OBJECT) });
+    emit({ type: "end", stopReason: "end_turn", sessionId, requestId: "req-fake", structuredOutput: REVIEW_OBJECT });
+  } else {
+    emit({ type: "tool_call", toolCallId: "c1", title: "Read", kind: "read", status: "in_progress", toolName: "read_file", rawInput: { path: "src/main.ts" } });
+    emit({ type: "tool_call_update", toolCallId: "c1", status: "completed", toolName: "read_file" });
+    emit({
+      type: "text",
+      data: JSON.stringify({
+        verdict: "needs-attention",
+        summary: "Found one material issue in the change set.",
+        findings: [{ title: "Missing null check", body: "The new parser assumes input is always present.", file: "src/main.ts", line_start: 12, line_end: 18, recommendation: "Guard against null input before parsing." }],
+        next_steps: ["Add a unit test for empty input."]
+      })
+    });
+    emit({ type: "end", stopReason: "end_turn", sessionId, requestId: "req-fake" });
+  }
+  state.sessions.push(sessionId);
+  saveState(state);
+  process.exit(0);
+}
+
+if (BEHAVIOR === "review-sandbox-unapplied" || BEHAVIOR === "review-writes-file" || BEHAVIOR === "review-sandbox-writable-workspace" || BEHAVIOR === "review-sandbox-ambiguous") {
   if (BEHAVIOR === "review-writes-file") {
     // What an unfenced shell makes possible: the review wrote into the tree.
     fs.writeFileSync(path.join(parsed.flags.cwd || process.cwd(), "leaked.txt"), "written by the review\\n");

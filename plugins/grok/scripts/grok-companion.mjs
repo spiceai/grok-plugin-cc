@@ -311,32 +311,103 @@ function hasToolCalls(result) {
 }
 
 /**
+ * Enough of JSON Schema to check `review-output.schema.json`: types, required
+ * and additional properties, enums, numeric ranges, string and array lengths.
+ * Returns the first violation, or null.
+ */
+function findSchemaViolation(value, schema, location = "the review") {
+  if (!schema || typeof schema !== "object") {
+    return null;
+  }
+  switch (schema.type) {
+    case "object": {
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        return `${location} must be an object`;
+      }
+      for (const key of schema.required ?? []) {
+        if (!(key in value)) {
+          return `${location} is missing \`${key}\``;
+        }
+      }
+      for (const [key, child] of Object.entries(value)) {
+        const childSchema = schema.properties?.[key];
+        if (!childSchema) {
+          if (schema.additionalProperties === false) {
+            return `${location} has an unexpected \`${key}\``;
+          }
+          continue;
+        }
+        const violation = findSchemaViolation(child, childSchema, `${location}.${key}`);
+        if (violation) {
+          return violation;
+        }
+      }
+      return null;
+    }
+    case "array": {
+      if (!Array.isArray(value)) {
+        return `${location} must be an array`;
+      }
+      if (schema.maxItems != null && value.length > schema.maxItems) {
+        return `${location} has ${value.length} items; the schema allows ${schema.maxItems}`;
+      }
+      for (const [index, item] of value.entries()) {
+        const violation = findSchemaViolation(item, schema.items, `${location}[${index + 1}]`);
+        if (violation) {
+          return violation;
+        }
+      }
+      return null;
+    }
+    case "string": {
+      if (typeof value !== "string") {
+        return `${location} must be a string`;
+      }
+      if (Array.isArray(schema.enum) && !schema.enum.includes(value)) {
+        return `${location} is ${JSON.stringify(value)}; the schema allows ${schema.enum.map((option) => `\`${option}\``).join(" or ")}`;
+      }
+      if (schema.minLength != null && value.length < schema.minLength) {
+        return `${location} must not be empty`;
+      }
+      if (schema.maxLength != null && value.length > schema.maxLength) {
+        return `${location} is ${value.length} characters; the schema allows ${schema.maxLength}`;
+      }
+      return null;
+    }
+    case "integer":
+    case "number": {
+      if (typeof value !== "number" || !Number.isFinite(value) || (schema.type === "integer" && !Number.isInteger(value))) {
+        return `${location} must be ${schema.type === "integer" ? "an integer" : "a number"}`;
+      }
+      if (schema.minimum != null && value < schema.minimum) {
+        return `${location} is ${value}; the schema requires at least ${schema.minimum}`;
+      }
+      if (schema.maximum != null && value > schema.maximum) {
+        return `${location} is ${value}; the schema allows at most ${schema.maximum}`;
+      }
+      return null;
+    }
+    default:
+      return null;
+  }
+}
+
+/**
  * Why a parsed object cannot be handed on as a review, or null.
  *
  * The investigation runs unconstrained, so nothing validated the object before
- * it got here: this is the shape gate `--json-schema` used to be. A miss is a
- * formatting problem, which the schema-constrained re-emit exists to fix.
+ * it got here: this is the gate `--json-schema` used to be, and it checks the
+ * whole of `review-output.schema.json`, so the payload keeps honoring the
+ * schema. A miss is a formatting problem, which the schema-constrained re-emit
+ * exists to fix.
  */
 function findMalformedReviewReason(review, schema) {
   const shapeError = validateReviewResultShape(review);
   if (shapeError) {
     return `Grok's JSON was not a review. ${shapeError}`;
   }
-  const verdicts = schema?.properties?.verdict?.enum ?? [];
-  if (verdicts.length > 0 && !verdicts.includes(review.verdict)) {
-    return `Grok's JSON used the verdict ${JSON.stringify(review.verdict)}; the schema allows ${verdicts.map((verdict) => `\`${verdict}\``).join(" or ")}.`;
-  }
-  const incomplete = review.findings.findIndex(
-    (finding) =>
-      !finding ||
-      typeof finding !== "object" ||
-      Array.isArray(finding) ||
-      ["title", "body", "file"].some((field) => typeof finding[field] !== "string" || !finding[field].trim())
-  );
-  if (incomplete !== -1) {
-    return `Grok's JSON finding ${incomplete + 1} is missing its title, body, or file.`;
-  }
-  return null;
+  const violation = findSchemaViolation(review, schema);
+  return violation ? `Grok's JSON does not match the review schema: ${violation}.` : null;
 }
 
 /** A parsed object is only useful as a review if it carries the review fields. */
@@ -439,6 +510,23 @@ function parseReviewOutput(result, options = {}) {
     // that skipped it, still carries the review. Everything else missing is a
     // shape problem worth a re-emit.
     const review = { next_steps: [], ...parsed.parsed };
+    if (parsed.recovered && Array.isArray(review.findings)) {
+      // Salvage keeps only the findings that were written out whole; one cut
+      // mid-way is not evidence of anything. But a finding was being written,
+      // so an approval with none left is the model's concern erased by the
+      // cut, not an all-clear it gave.
+      const findingSchema = options.schema?.properties?.findings?.items;
+      const whole = review.findings.filter((finding) => !findSchemaViolation(finding, findingSchema, "finding"));
+      if (whole.length < review.findings.length && whole.length === 0 && !/needs.?attention|block|reject/i.test(String(review.verdict))) {
+        return {
+          ...parsed,
+          parsed: null,
+          parseError:
+            "Grok's review was cut off in the middle of a finding, so the only thing left to recover was an approval with no findings. Treating that as 'no issues found' would be wrong."
+        };
+      }
+      review.findings = whole;
+    }
     const malformedReason = findMalformedReviewReason(review, options.schema);
     if (malformedReason) {
       return { ...parsed, parsed: null, parseError: malformedReason };
@@ -586,7 +674,8 @@ async function executeReviewRun(request) {
       model: request.model,
       onProgress: request.onProgress
     });
-    const workingTreeChanges = diffWorkingTreeFingerprints(treeBefore, fingerprintWorkingTree(repoRoot));
+    const treeCheck = diffWorkingTreeFingerprints(treeBefore, fingerprintWorkingTree(repoRoot));
+    const workingTreeChanges = treeCheck.changed;
     const payload = {
       review: reviewName,
       target,
@@ -594,6 +683,7 @@ async function executeReviewRun(request) {
       sourceThreadId: result.sourceThreadId,
       sandbox: result.sandbox ?? null,
       workingTreeChanges,
+      workingTreeUnverified: treeCheck.unverified,
       grok: {
         status: result.status,
         stderr: result.stderr,
@@ -612,7 +702,8 @@ async function executeReviewRun(request) {
         targetLabel: target.label,
         reasoningSummary: result.reasoningSummary,
         sandbox: result.sandbox,
-        workingTreeChanges
+        workingTreeChanges,
+        workingTreeUnverified: treeCheck.unverified
       }
     );
 
@@ -625,7 +716,8 @@ async function executeReviewRun(request) {
       summary: prefixIntegrityWarning(
         workingTreeChanges,
         result.sandbox,
-        firstMeaningfulLine(result.reviewText, `${reviewName} completed.`)
+        firstMeaningfulLine(result.reviewText, `${reviewName} completed.`),
+        treeCheck.unverified
       ),
       jobTitle: `Grok ${reviewName}`,
       jobClass: "review",
@@ -722,7 +814,8 @@ async function executeReviewRun(request) {
       parsed = retryParsed;
     }
   }
-  const workingTreeChanges = diffWorkingTreeFingerprints(treeBefore, fingerprintWorkingTree(repoRoot));
+  const treeCheck = diffWorkingTreeFingerprints(treeBefore, fingerprintWorkingTree(repoRoot));
+  const workingTreeChanges = treeCheck.changed;
   const sandbox = worstSandboxOutcome(sandboxOutcomes);
   const payload = {
     review: reviewName,
@@ -735,6 +828,7 @@ async function executeReviewRun(request) {
     },
     sandbox,
     workingTreeChanges,
+    workingTreeUnverified: treeCheck.unverified,
     grok: {
       status: result.status,
       stderr: result.stderr,
@@ -762,12 +856,14 @@ async function executeReviewRun(request) {
       targetLabel: context.target.label,
       reasoningSummary: result.reasoningSummary,
       sandbox,
-      workingTreeChanges
+      workingTreeChanges,
+      workingTreeUnverified: treeCheck.unverified
     }),
     summary: prefixIntegrityWarning(
       workingTreeChanges,
       sandbox,
-      parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`)
+      parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
+      treeCheck.unverified
     ),
     jobTitle: `Grok ${reviewName}`,
     jobClass: "review",
@@ -854,9 +950,12 @@ async function executeTaskRun(request) {
  * `/grok:status` shows one line per job. A review that ran unfenced, or that
  * changed the tree, must not read as routine there.
  */
-function prefixIntegrityWarning(workingTreeChanges, sandbox, summary) {
+function prefixIntegrityWarning(workingTreeChanges, sandbox, summary, workingTreeUnverified = null) {
   if (workingTreeChanges.length > 0) {
     return `Warning: the working tree changed during the review. ${summary}`;
+  }
+  if (workingTreeUnverified) {
+    return `Warning: the working tree could not be verified after the review. ${summary}`;
   }
   if (sandbox?.requested && sandbox.applied === false) {
     return `Warning: ran without the ${sandbox.requested} sandbox. ${summary}`;

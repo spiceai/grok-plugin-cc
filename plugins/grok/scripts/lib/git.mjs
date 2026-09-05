@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -216,32 +215,61 @@ export function getCurrentBranch(cwd) {
   return gitChecked(cwd, ["branch", "--show-current"]).stdout.trim() || "HEAD";
 }
 
-// Hashing the whole diff is what makes the fingerprint honest about files
-// that were already dirty; a diff past this size is skipped and those files
-// are covered by their status codes alone.
-const FINGERPRINT_DIFF_MAX_BYTES = 64 * 1024 * 1024;
 // A key no path can collide with, for the commit and ref HEAD points at.
 const FINGERPRINT_HEAD_KEY = "\0HEAD";
 
+function describeGitFailure(result) {
+  return result.error?.message ?? result.stderr.trim() ?? `exit ${result.status}`;
+}
+
 /**
- * A per-path fingerprint of everything uncommitted: the porcelain status code,
- * a hash of each tracked change against HEAD, size plus mtime for untracked
- * files, and the commit and ref HEAD points at. Taken before and after a
- * review and compared, it catches a run that modified the tree — or committed,
- * stashed, or checked something out — no matter what the sandbox did:
- * `--sandbox` is a request the CLI drops silently when the kernel policy
- * cannot be applied. Hooks and config inside `.git` are covered too, since a
- * hook written there runs later on the user's own commands. Paths git ignores
- * (build output, dependencies) are not.
+ * Size and mtime of what a path resolves to — through a symlink, so a write
+ * to the target counts — falling back to the link itself when it dangles.
+ */
+function statDetail(absolutePath) {
+  for (const probe of [fs.statSync, fs.lstatSync]) {
+    try {
+      const stat = probe(absolutePath);
+      return `${stat.size}@${Math.round(stat.mtimeMs)}`;
+    } catch {
+      // Try the next probe.
+    }
+  }
+  return "absent";
+}
+
+function isRegularFile(absolutePath) {
+  try {
+    return fs.statSync(absolutePath).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A per-path fingerprint of everything uncommitted: the porcelain status code
+ * and a content hash for every changed tracked file, size plus mtime for
+ * untracked files, the commit and ref HEAD points at, and the hooks and config
+ * git would run from. Taken before and after a review and compared, it catches
+ * a run that modified the tree — or committed, stashed, checked something out,
+ * or planted a hook — no matter what the sandbox did: `--sandbox` is a request
+ * the CLI drops silently when the kernel policy cannot be applied.
  *
- * @returns {Map<string, string>}
+ * Content is hashed by `git hash-object`, which streams each file, so there is
+ * no size past which the check quietly degrades; if any step fails the result
+ * says so and the comparison reports the tree as unverified rather than
+ * unchanged. Paths git ignores (build output, dependencies) are not covered.
+ *
+ * @returns {{ entries: Map<string, string>, incomplete: string | null }}
  */
 export function fingerprintWorkingTree(cwd) {
   const entries = new Map();
   const status = git(cwd, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
   if (status.error || status.status !== 0) {
-    return entries;
+    return { entries, incomplete: `git status failed: ${describeGitFailure(status)}` };
   }
+
+  const toHash = [];
   const records = status.stdout.split("\0");
   for (let index = 0; index < records.length; index += 1) {
     const record = records[index];
@@ -254,33 +282,31 @@ export function fingerprintWorkingTree(cwd) {
     if (/[RC]/.test(code)) {
       index += 1;
     }
-    let detail = code;
+    const absolutePath = path.join(cwd, filePath);
     if (code === "??") {
-      try {
-        const stat = fs.statSync(path.join(cwd, filePath));
-        detail = `${code} ${stat.size}@${Math.round(stat.mtimeMs)}`;
-      } catch {
-        detail = `${code} unreadable`;
-      }
+      entries.set(filePath, `?? ${statDetail(absolutePath)}`);
+    } else if (isRegularFile(absolutePath)) {
+      entries.set(filePath, code);
+      toHash.push(filePath);
+    } else {
+      // Deleted, a submodule, or a symlink: the status code and lstat cover it.
+      entries.set(filePath, `${code} ${statDetail(absolutePath)}`);
     }
-    entries.set(filePath, detail);
   }
 
   // Further edits to a tracked file that was already modified do not move its
-  // status code, and can keep its line counts too; the content of its diff
-  // cannot stay the same. Fails in a repository with no commits yet, where the
-  // status codes alone still catch anything new.
-  const diff = git(cwd, ["diff", "HEAD", "--no-ext-diff", "--binary"], { maxBuffer: FINGERPRINT_DIFF_MAX_BYTES });
-  if (!diff.error && diff.status === 0) {
-    for (const section of diff.stdout.split(/^(?=diff --git )/m)) {
-      if (!section.startsWith("diff --git ")) {
-        continue;
-      }
-      const header = section.slice(0, section.indexOf("\n"));
-      const filePath = /^diff --git a\/(.+?) b\/(.+)$/.exec(header)?.[2] ?? header;
-      const digest = createHash("sha256").update(section).digest("hex").slice(0, 16);
-      entries.set(filePath, `${entries.get(filePath) ?? "M "} ${digest}`);
+  // status code, and can keep its size and line counts too; its content hash
+  // cannot stay the same. One git process hashes every path.
+  if (toHash.length > 0) {
+    const hashed = git(cwd, ["hash-object", "--stdin-paths"], { input: `${toHash.join("\n")}\n` });
+    if (hashed.error || hashed.status !== 0) {
+      return { entries, incomplete: `git hash-object failed: ${describeGitFailure(hashed)}` };
     }
+    const digests = hashed.stdout.trim().split("\n");
+    if (digests.length !== toHash.length) {
+      return { entries, incomplete: `git hash-object returned ${digests.length} digests for ${toHash.length} paths` };
+    }
+    toHash.forEach((filePath, index) => entries.set(filePath, `${entries.get(filePath)} ${digests[index]}`));
   }
 
   // A commit, stash, checkout or branch switch can leave the tree looking
@@ -292,21 +318,32 @@ export function fingerprintWorkingTree(cwd) {
     `${head.status === 0 ? head.stdout.trim() : "unborn"} ${ref.status === 0 ? ref.stdout.trim() : "detached"}`
   );
 
-  // A hook or config written into .git shows nothing in the tree and runs
-  // later, on the user's own git commands.
-  const gitDir = git(cwd, ["rev-parse", "--git-dir"]);
-  if (gitDir.status === 0) {
-    const dir = path.resolve(cwd, gitDir.stdout.trim());
-    for (const candidate of [path.join(dir, "config"), ...listHooks(path.join(dir, "hooks"))]) {
-      try {
-        const stat = fs.statSync(candidate);
-        entries.set(`.git/${path.relative(dir, candidate)}`, `${stat.size}@${Math.round(stat.mtimeMs)}`);
-      } catch {
-        // Absent is fine; it only matters if it appears.
-      }
+  // A hook or config written into the git directory shows nothing in the tree
+  // and runs later, on the user's own git commands. In a linked worktree the
+  // hooks and shared config live in the common directory, the per-worktree
+  // config in the worktree's own; `core.hooksPath` can move the hooks anywhere.
+  const dirs = git(cwd, ["rev-parse", "--git-dir", "--git-common-dir"]);
+  if (dirs.error || dirs.status !== 0) {
+    return { entries, incomplete: `git rev-parse failed: ${describeGitFailure(dirs)}` };
+  }
+  const [gitDirRaw, commonDirRaw] = dirs.stdout.trim().split("\n");
+  const gitDir = path.resolve(cwd, gitDirRaw);
+  const commonDir = path.resolve(cwd, commonDirRaw ?? gitDirRaw);
+  const hooksPath = git(cwd, ["config", "--get", "core.hooksPath"]);
+  const hooksDir =
+    hooksPath.status === 0 && hooksPath.stdout.trim() ? path.resolve(cwd, hooksPath.stdout.trim()) : path.join(commonDir, "hooks");
+  const watched = new Set([path.join(commonDir, "config"), path.join(gitDir, "config.worktree"), ...listHooks(hooksDir)]);
+  for (const candidate of watched) {
+    try {
+      const stat = fs.statSync(candidate);
+      const inCommon = path.relative(commonDir, candidate);
+      const label = inCommon && !inCommon.startsWith("..") ? `.git/${inCommon}` : path.relative(cwd, candidate);
+      entries.set(label, `${stat.size}@${Math.round(stat.mtimeMs)}`);
+    } catch {
+      // Absent is fine; it only matters if it appears.
     }
   }
-  return entries;
+  return { entries, incomplete: null };
 }
 
 function listHooks(hooksDir) {
@@ -321,22 +358,36 @@ function listHooks(hooksDir) {
 }
 
 /**
- * Paths whose fingerprint differs between two snapshots, sorted; a moved HEAD
- * is reported as `HEAD`.
+ * Compare two fingerprints: the paths whose entry differs, sorted, with a moved
+ * HEAD reported as `HEAD`; and, when either snapshot could not be completed,
+ * why — a partial comparison is not proof that nothing changed.
+ *
+ * An incomplete snapshot lacks the content hashes a complete one carries, so
+ * comparing the two in full would report every hashed path as edited. When
+ * either side is incomplete only the status codes are compared: new, deleted
+ * and re-staged paths still show, content changes are what the unverified
+ * flag is for.
+ *
+ * @returns {{ changed: string[], unverified: string | null }}
  */
 export function diffWorkingTreeFingerprints(before, after) {
+  const unverified = before.incomplete ?? after.incomplete ?? null;
+  const comparable = (detail) => (unverified ? String(detail).split(" ")[0] : detail);
   const changed = new Set();
-  for (const [filePath, detail] of before) {
-    if (after.get(filePath) !== detail) {
+  for (const [filePath, detail] of before.entries) {
+    if (!after.entries.has(filePath) || comparable(after.entries.get(filePath)) !== comparable(detail)) {
       changed.add(filePath);
     }
   }
-  for (const [filePath, detail] of after) {
-    if (before.get(filePath) !== detail) {
+  for (const [filePath, detail] of after.entries) {
+    if (!before.entries.has(filePath) || comparable(before.entries.get(filePath)) !== comparable(detail)) {
       changed.add(filePath);
     }
   }
-  return [...changed].map((filePath) => (filePath === FINGERPRINT_HEAD_KEY ? "HEAD" : filePath)).sort();
+  return {
+    changed: [...changed].map((filePath) => (filePath === FINGERPRINT_HEAD_KEY ? "HEAD" : filePath)).sort(),
+    unverified
+  };
 }
 
 export function getWorkingTreeState(cwd) {
@@ -457,9 +508,10 @@ function formatUntrackedFileBlock(relativePath, file) {
  * their size for the model to read with its tools. Skipped entries (directories,
  * binaries, oversized files) cost nothing and are always noted.
  *
- * `omitted` counts the text files the model has to read itself — oversized or
- * past the budget — so the caller knows whether the prompt carries the whole
- * change or Grok must go and look.
+ * `omitted` counts everything the prompt does not carry — text files past the
+ * budget or the per-file cap, and every skipped entry, since a binary, a
+ * nested repository, or an unreadable path is still part of the change — so
+ * the caller knows whether Grok must go and look.
  */
 function renderUntrackedFiles(cwd, files, budgetBytes) {
   let remaining = budgetBytes;
@@ -469,9 +521,7 @@ function renderUntrackedFiles(cwd, files, budgetBytes) {
   const blocks = files.map((relativePath) => {
     const file = inspectUntrackedFile(cwd, relativePath);
     if (file.skipped) {
-      if (file.oversized) {
-        omitted += 1;
-      }
+      omitted += 1;
       return formatUntrackedFileBlock(relativePath, file);
     }
     if (file.size > remaining) {

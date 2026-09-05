@@ -209,6 +209,28 @@ test("adversarial review refuses a salvaged all-clear and restates the review in
 });
 
 /**
+ * Salvage keeps only whole findings. When the cut lands inside the only
+ * finding under an approving verdict, what is left is an approval with no
+ * findings — the model's concern erased by the cut — and it must not ship.
+ */
+test("a salvaged approval whose only finding was cut off is restated, not shipped", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-truncated-approve-mid-finding");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+
+  assert.equal(payload.parseError, null);
+  assert.equal(payload.result.verdict, "needs-attention", "the re-emitted review replaced the salvage");
+  assert.equal(payload.result.findings.length, 1);
+  assert.equal(grokRuns(binDir).length, 2, "the salvage must have been sent back");
+});
+
+/**
  * The failure this guards against was observed three runs running: Grok ended
  * its turn with `{"verdict":"needs-attention","summary":"PLACEHOLDER",
  * "findings":[]}`. It parses, it validates against the schema, and it renders
@@ -521,8 +543,63 @@ test("a review whose sandbox outcome was not recorded says it could not be confi
     { parsed: { verdict: "approve", summary: "Fine.", findings: [], next_steps: [] }, parseError: null },
     { reviewLabel: "Adversarial Review", targetLabel: "working tree diff", sandbox: { requested: "read-only", applied: null } }
   );
-  assert.match(rendered, /Note: Grok's sandbox event log has no record of whether the `read-only` sandbox was enforced/);
+  assert.match(rendered, /Note: whether the `read-only` sandbox was enforced for this run could not be confirmed/);
   assert.match(rendered, /Verdict: approve/);
+});
+
+/**
+ * The log carries no session id, so attribution is by append order. When the
+ * records a run appended disagree — a concurrent run in the same tree, or a
+ * forged entry — the outcome is unconfirmed, never resolved either way.
+ */
+test("sandbox events that disagree during a run are reported as unconfirmed", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-sandbox-ambiguous");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.sandbox.applied, null);
+  assert.match(payload.sandbox.detail, /disagree, so the outcome is ambiguous/);
+
+  const rendered = run("node", [SCRIPT, "adversarial-review"], { cwd, env });
+  assert.match(rendered.stdout, /Note: whether the `read-only` sandbox was enforced for this run could not be confirmed .*ambiguous/);
+});
+
+/** A fingerprint that could not be completed must read as unverified, not clean. */
+test("a review whose tree could not be verified says so", async () => {
+  const { renderReviewResult } = await import("../plugins/grok/scripts/lib/render.mjs");
+  const rendered = renderReviewResult(
+    { parsed: { verdict: "approve", summary: "Fine.", findings: [], next_steps: [] }, parseError: null },
+    { reviewLabel: "Adversarial Review", targetLabel: "working tree diff", workingTreeChanges: [], workingTreeUnverified: "git hash-object failed: boom" }
+  );
+  assert.match(rendered, /Warning: the working tree could not be verified after this review \(git hash-object failed: boom\)/);
+});
+
+/**
+ * The payload promises `review-output.schema.json`. An unconstrained answer
+ * that drops a required field has to go through the schema-constrained
+ * re-emit, not be handed on with the gap normalized away.
+ */
+test("a finding missing schema fields is re-emitted under the schema", () => {
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "review-missing-fields");
+  const env = buildEnv(binDir);
+  env.CLAUDE_PLUGIN_DATA = makeTempDir("plugin-data-");
+  const cwd = prepareRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.parseError, null);
+  assert.equal(payload.result.findings[0].severity, "high");
+  assert.equal(payload.result.findings[0].confidence, 0.9);
+
+  const [, reemit] = grokRuns(binDir);
+  assert.ok(reemit.includes("--json-schema"), "the missing fields are restored by the schema-constrained re-emit");
 });
 
 /**

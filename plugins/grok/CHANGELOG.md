@@ -15,10 +15,11 @@ reported that as a failed review, but it failed every time.
   its tools free; `--json-schema` is used only for the tool-free re-emit turn,
   where a constrained answer is exactly what is wanted.
 - With nothing constraining the investigation, the companion now does the
-  checking the CLI used to do. An object that parses but is not a review (a
-  missing field, a verdict outside the schema, a finding without a title, body,
-  or file) goes to the schema-constrained re-emit instead of being rendered as
-  one. And when the change was not carried in the prompt — the lightweight
+  checking the CLI used to do. An object that does not satisfy
+  `review-output.schema.json` — a missing field, a verdict outside the enum, a
+  finding without one of its eight required fields, a value out of range — goes
+  to the schema-constrained re-emit instead of being rendered as a review, so
+  the JSON payload keeps honoring the schema. And when the change was not carried in the prompt — the lightweight
   context for reviews over two files — an answer given without a single tool
   call is treated as unfinished rather than accepted: an `approve` written from
   the file list would otherwise read as a clean bill of health.
@@ -35,16 +36,19 @@ reported that as a failed review, but it failed every time.
 - Reviews now verify their read-only promise instead of assuming it. The
   `read-only` sandbox is a request the CLI drops silently when the kernel
   policy cannot be applied, and headless stderr is quiet, so after every
-  review the companion reads the sandbox event log to learn whether the
-  profile was enforced and whether it actually covers the repository, and
-  fingerprints the working tree — every uncommitted change hashed per file,
-  untracked files, HEAD, and the hooks and config inside `.git` — before and
-  after the run. A review that ran unfenced, a repository the profile leaves
-  writable, or a tree that changed while the review ran is reported above the
-  findings, in the JSON payload, and in the `/grok:status` summary; a
-  multi-turn review reports its worst turn, since the first turn is where the
-  tools ran, and an outcome the log did not record is said to be unconfirmed
-  rather than implied clean. Measured on grok 1.0.13: Seatbelt does block
+  review the companion reads what the run appended to the sandbox event log
+  to learn whether the profile was enforced and whether it actually covers the
+  repository, and fingerprints the working tree — every changed tracked file
+  content-hashed by `git hash-object`, untracked files, HEAD, and the hooks
+  and config git would run from, in the common git directory of a linked
+  worktree too — before and after the run. A review that ran unfenced, a
+  repository the profile leaves writable, or a tree that changed while the
+  review ran is reported above the findings, in the JSON payload, and in the
+  `/grok:status` summary; a multi-turn review reports its worst turn, since
+  the first turn is where the tools ran; an outcome the log did not record, or
+  records that disagree, is said to be unconfirmed rather than implied clean;
+  and a fingerprint that could not be completed is reported as an unverified
+  tree, never as an unchanged one. Measured on grok 1.0.13: Seatbelt does block
   writes into a repository under `read-only`, but the profile keeps the system
   temp directories writable by design, so a checkout under `/tmp` is not
   fenced by it — and `--permission-mode dontAsk` does not stop shell writes on

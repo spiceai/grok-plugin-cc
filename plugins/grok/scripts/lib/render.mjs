@@ -241,7 +241,12 @@ function reviewIntegrityWarnings(meta = {}) {
     );
   } else if (sandbox?.requested && sandbox.applied == null) {
     lines.push(
-      `Note: Grok's sandbox event log has no record of whether the \`${sandbox.requested}\` sandbox was enforced for this run, so that could not be confirmed.`
+      `Note: whether the \`${sandbox.requested}\` sandbox was enforced for this run could not be confirmed from Grok's sandbox event log${sandbox.detail ? ` (${sandbox.detail})` : ""}.`
+    );
+  }
+  if (meta.workingTreeUnverified) {
+    lines.push(
+      `Warning: the working tree could not be verified after this review (${meta.workingTreeUnverified}), so a change made during it would not have been detected. Check \`git status\` before trusting the result.`
     );
   }
   const changes = Array.isArray(meta.workingTreeChanges) ? meta.workingTreeChanges : [];
